@@ -30,6 +30,7 @@ from backend.app.models.topic import Topic
 from backend.app.models.subject import Subject
 from backend.app.models.progress import ProgressRecord
 from backend.app.models.schedule import ScheduleEntry
+from backend.app.services.adaptive_agent import AdaptiveAgent
 from backend.app.schemas.quiz import (
     QuizGenerateRequest,
     QuizSubmitRequest,
@@ -39,6 +40,7 @@ from backend.app.schemas.quiz import (
 
 _UNIT_PREFIX_RE = re.compile(r"^\s*(Unit\s+[IVXLC\d]+)\s*:\s*(.+)$", re.IGNORECASE)
 _PART_SPLIT_RE = re.compile(r"\s*(?:,|;|\||/|&|\band\b)\s*", re.IGNORECASE)
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 def _fallback_distractors(core: str) -> list[str]:
     """Construct topic-aware distractors instead of generic 'unrelated' fillers."""
     base = _normalize_phrase(core) or "the topic"
@@ -107,8 +109,9 @@ PASS_THRESHOLDS = {
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Keep outbound LLM calls fast so the UI never times out
-_LLM_TIMEOUT = httpx.Timeout(connect=5.0, read=8.0, write=8.0, pool=None)
+# Keep outbound LLM calls fast so the UI never times out.
+_LLM_TIMEOUT = httpx.Timeout(connect=4.0, read=6.0, write=6.0, pool=None)
+_QUIZ_BATCH_TIMEOUT_SECS = 10.0
 
 
 def _strip_unit_prefix(topic_name: str) -> tuple[str, str | None]:
@@ -127,6 +130,176 @@ def _normalize_question_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip()).lower()
 
 
+def _groq_max_tokens_for_quiz(count: int) -> int:
+    """Scale the completion budget with requested question count to avoid truncation."""
+    safe_count = max(1, int(count))
+    return min(1400, max(450, 110 * safe_count + 80))
+
+
+def _groq_models_to_try() -> list[str]:
+    primary = str(getattr(settings, "groq_model", "") or "").strip()
+    fallback_raw = str(getattr(settings, "groq_fallback_models", "") or "").strip()
+    candidates = [primary] if primary else []
+    if fallback_raw:
+        candidates.extend(
+            model.strip() for model in fallback_raw.split(",") if model.strip()
+        )
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for model in candidates:
+        key = model.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(model)
+    return deduped
+
+
+def _extract_retry_hint(text: str) -> str | None:
+    if not text:
+        return None
+    match = re.search(r"try again in ([0-9a-zA-Z\s:]+?)(?:[.,]|$)", text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip().rstrip(".")
+    return None
+
+
+def _extract_json_payload(content: str) -> Any:
+    """Parse JSON from strict output, fenced code blocks, or text-wrapped payloads."""
+    if not content:
+        raise ValueError("Groq response missing content")
+
+    decoder = json.JSONDecoder()
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add_candidate(candidate: str) -> None:
+        text = candidate.strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        candidates.append(text)
+
+    _add_candidate(content)
+    for match in _CODE_FENCE_RE.finditer(content):
+        _add_candidate(match.group(1))
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+        for idx, char in enumerate(candidate):
+            if char not in "[{":
+                continue
+            snippet = candidate[idx:].strip()
+            try:
+                parsed, _ = decoder.raw_decode(snippet)
+                return parsed
+            except json.JSONDecodeError:
+                continue
+
+    raise ValueError("Groq response JSON parse failed")
+
+
+def _question_lead_signature(text: str) -> str:
+    normalized = _normalize_question_text(text)
+    words = [word for word in re.findall(r"[a-z0-9]+", normalized) if word]
+    if not words:
+        return ""
+    return " ".join(words[:5])
+
+
+def _has_bad_option(*options: str) -> bool:
+    normalized_options = [_normalize_phrase(option) for option in options]
+    if len(normalized_options) != 4:
+        return True
+
+    seen: set[str] = set()
+    for option in normalized_options:
+        if not option or len(option) < 2:
+            return True
+        lowered = option.lower()
+        if lowered.startswith("option "):
+            return True
+        key = re.sub(r"[^a-z0-9]+", "", lowered)
+        if not key or key in seen:
+            return True
+        seen.add(key)
+    return False
+
+
+def _is_generic_textbook_stem(
+    qtext: str, topic_name: str, subject_name: str | None = None
+) -> bool:
+    normalized = _normalize_question_text(qtext)
+    if not normalized:
+        return True
+
+    generic_patterns = [
+        "primary goal of",
+        "purpose of",
+        "common assumption of",
+        "common misconception about",
+        "which of the following is a common assumption",
+        "what is the primary goal",
+        "what is the purpose",
+        "a common misconception",
+        "which of the following is a common",
+    ]
+    if any(pattern in normalized for pattern in generic_patterns):
+        topic_tokens = _topic_keywords(topic_name, subject_name)
+        if not topic_tokens or not any(token in normalized for token in topic_tokens):
+            return True
+
+    meta_patterns = [
+        "according to the syllabus",
+        "in this unit",
+        "the chapter discusses",
+        "learning outcome",
+        "study tip",
+        "revision strategy",
+    ]
+    return any(pattern in normalized for pattern in meta_patterns)
+
+
+def _topic_keywords(topic_name: str, subject_name: str | None = None) -> set[str]:
+    stop = {
+        "the",
+        "a",
+        "an",
+        "of",
+        "and",
+        "to",
+        "in",
+        "for",
+        "on",
+        "by",
+        "with",
+        "from",
+        "using",
+        "unit",
+        "chapter",
+        "topic",
+        "introduction",
+        "basics",
+        "overview",
+    }
+    tokens: set[str] = set()
+    for source in [topic_name, subject_name]:
+        if not source:
+            continue
+        cleaned = re.sub(r"[^a-z0-9]+", " ", source.lower())
+        for token in cleaned.split():
+            if len(token) < 4 or token in stop:
+                continue
+            tokens.add(token)
+    return tokens
+
+
+
+
 def _is_question_on_topic(
     qtext: str, topic_name: str, subject_name: str | None = None
 ) -> bool:
@@ -143,9 +316,22 @@ def _is_question_on_topic(
             continue
         if key in normalized_q:
             return True
+    topic_tokens = _topic_keywords(topic_name, subject_name)
+    if topic_tokens:
+        overlap = sum(1 for token in topic_tokens if token in normalized_q)
+        if overlap >= min(2, len(topic_tokens)):
+            return True
+        # For narrow technical topics, one strong keyword hit is often enough.
+        if overlap >= 1 and len(topic_tokens) <= 3:
+            return True
     if subject_name:
-        subject_key = _normalize_question_text(subject_name)
-        if subject_key and len(subject_key) >= 4 and subject_key in normalized_q:
+        subject_parts = _split_topic_parts(subject_name)
+        for part in subject_parts or [subject_name]:
+            subject_key = _normalize_question_text(part)
+            if subject_key and len(subject_key) >= 4 and subject_key in normalized_q:
+                return True
+        subject_tokens = _topic_keywords(subject_name)
+        if subject_tokens and any(token in normalized_q for token in subject_tokens):
             return True
     return False
 def _is_low_quality_question(qtext: str) -> bool:
@@ -156,46 +342,8 @@ def _is_low_quality_question(qtext: str) -> bool:
     # Allow slightly shorter LLM questions to avoid over-filtering
     if len(normalized) < 24:
         return True
-    banned_fragments = [
-        "which unit",
-        "unit i",
-        "unit ii",
-        "unit iii",
-        "unit iv",
-        "which chapter",
-        "in the syllabus",
-        "mapped to which",
-        "what is this topic called",
-        "choose the topic name",
-        "learning outcome",
-        "best learning outcome",
-        "key concept check",
-        "before an exam",
-        "revision steps",
-        "mapped to your syllabus",
-        "only headings",
-        "guess answers",
-    ]
-    return any(fragment in normalized for fragment in banned_fragments)
-
-
-def _has_bad_option(*options: str) -> bool:
-    """Filter out generic or meta options that make quizzes feel canned."""
-    banned_fragments = [
-        "unrelated",
-        "random memorization",
-        "guess answers",
-        "only headings",
-        "mapped to",
-        "unit ",
-        "syllabus",
-        "before an exam",
-        "best learning outcome",
-    ]
-    for opt in options:
-        normalized = _normalize_question_text(opt)
-        if any(fragment in normalized for fragment in banned_fragments):
-            return True
+    
+    
     return False
 
 
@@ -293,10 +441,8 @@ def _topic_grounded_mcq(
 
 
 def _generate_questions(topic_name: str, difficulty: str, count: int) -> list[dict]:
-    """Utility for synchronous rule-based question generation."""
-    return _generate_contextual_rule_based_questions(
-        topic_name, difficulty, count, []
-    )
+    """Static quiz generation is disabled; quizzes must come from Groq."""
+    return []
 
 
 def _generate_contextual_rule_based_questions(
@@ -306,243 +452,8 @@ def _generate_contextual_rule_based_questions(
     related_topics: list[str],
     used_questions: set[str] | None = None,
 ) -> list[dict]:
-    """Generate topic-grounded MCQs without an LLM."""
-    body, unit_label = _strip_unit_prefix(topic_name)
-    topic_parts = _split_topic_parts(topic_name)
-    related_clean = [_strip_unit_prefix(t)[0] for t in related_topics if t]
-    # Keep only related topics that actually share wording with the target topic
-    related_clean = _filter_related_by_overlap(topic_parts or [body], related_clean)
-    related_parts: list[str] = []
-    for related in related_clean:
-        related_parts.extend(_split_topic_parts(related))
-
-    if not topic_parts:
-        topic_parts = [body or topic_name]
-
-    generators: list[dict[str, Any]] = []
-
-    core = topic_parts[0]
-    generators.append(
-        {
-            "stem": f"In the context of '{body}', which concept is explicitly part of this topic?",
-            "correct": core,
-            "distractors": (related_parts + related_clean)[:3] or _fallback_distractors(core),
-            "explanation": f"'{core}' sits inside the scope of '{body}'.",
-        }
-    )
-
-    # Difficulty-tuned stems added to avoid repetition across levels and better align rigor
-    difficulty_profiles = {
-        "easy": [
-            {
-                "stem": f"What is the primary definition associated with '{core}'?",
-                "correct": f"The standard meaning of {core}",
-                "distractors": (related_clean[:3] or []) + _fallback_distractors(core),
-                "explanation": "Easy level checks core definition recall.",
-            },
-            {
-                "stem": f"Select the most basic example of '{core}'.",
-                "correct": f"A textbook example illustrating {core}",
-                "distractors": related_clean[:4] + _fallback_distractors(core),
-                "explanation": "Examples anchor basic understanding.",
-            },
-        ],
-        "medium": [
-            {
-                "stem": f"How would you apply '{core}' to solve a standard problem?",
-                "correct": f"Use {core} directly following its usual steps",
-            "distractors": (related_clean[:3] or []) + _fallback_distractors(core),
-            "explanation": "Medium level checks application of known steps.",
-        },
-        {
-            "stem": f"Which mistake is common when using '{core}'?",
-            "correct": f"Forgetting a key condition when applying {core}",
-                "distractors": (related_clean[:3] or []) + _fallback_distractors(core),
-                "explanation": "Targets misconception detection.",
-            },
-        ],
-        "hard": [
-            {
-                "stem": f"When analyzing a complex case, how does '{core}' interact with related topics?",
-                "correct": f"It must be combined with {related_clean[0] if related_clean else 'its prerequisites'} under given constraints",
-                "distractors": (related_clean[:4] or []) + _fallback_distractors(core),
-                "explanation": "Hard level checks integration and assumptions.",
-            },
-            {
-                "stem": f"Given a failure scenario using '{core}', what is the best remediation?",
-                "correct": f"Review the boundary conditions and adjust {core} accordingly",
-                "distractors": (related_clean[:4] or []) + _fallback_distractors(core),
-                "explanation": "Hard level focuses on troubleshooting and refinement.",
-            },
-        ],
-    }
-
-    if unit_label:
-        unit_token = unit_label.split()[-1]
-        generators.append(
-            {
-                "stem": f"When reviewing '{body}', which nearby topic strengthens understanding?",
-                "correct": related_clean[0] if related_clean else body,
-                "distractors": (related_clean[1:4] if len(related_clean) > 1 else []) + _fallback_distractors(core),
-                "explanation": "Connect the topic to an adjacent concept instead of meta unit mapping.",
-            }
-        )
-
-    focus_phrase = topic_parts[min(1, len(topic_parts) - 1)]
-    mastery_verb = {
-        "easy": "identify",
-        "medium": "apply",
-        "hard": "analyze",
-    }.get(difficulty.lower(), "apply")
-    generators.append(
-        {
-            "stem": f"Best learning outcome after studying '{body}' is to ______.",
-            "correct": f"{mastery_verb} {focus_phrase} correctly in real problems",
-            "distractors": _fallback_distractors(core),
-            "explanation": f"Mastery means you can {mastery_verb} '{focus_phrase}', not just recall headings.",
-        }
-    )
-
-    if related_clean:
-        related_pick = related_clean[0]
-        generators.append(
-            {
-                "stem": f"During revision of '{body}', which related topic should you connect for better retention?",
-                "correct": related_pick,
-                "distractors": (topic_parts if topic_parts else []) + _fallback_distractors(core),
-                "explanation": f"Linking to '{related_pick}' reinforces conceptual context.",
-            }
-        )
-
-    generators.append(
-        {
-            "stem": f"What is the most effective way to revise '{body}' before an exam?",
-            "correct": f"Break it into key parts ({', '.join(topic_parts[:2])}) and do active recall",
-            "distractors": [
-                "Skim once and avoid self-testing",
-                "Only read solved answers from other subjects",
-                "Skip it because it feels familiar",
-            ],
-            "explanation": "Chunking plus self-testing yields higher retention.",
-        }
-    )
-
-    # Broader stem pool to reduce fallback/fill usage when many prior questions exist
-    extra_generators = [
-        {
-            "stem": f"Which option directly belongs under '{body}'?",
-            "correct": core,
-            "distractors": related_clean[:2] + _fallback_distractors(core),
-            "explanation": f"'{core}' is central to '{body}'.",
-        },
-        {
-            "stem": f"What is the first step when approaching a practice problem on '{body}'?",
-            "correct": f"Identify the relevant concept: {core}",
-            "distractors": [
-                "Guess without reading the question",
-                "Start with an unrelated topic",
-                "Skip to the solution key immediately",
-            ],
-            "explanation": "Locating the core concept is the right starting point.",
-        },
-        {
-            "stem": f"A common pitfall when revising '{body}' is:",
-            "correct": "Memorizing steps without understanding conditions",
-            "distractors": [
-                "Checking worked examples",
-                "Practicing spaced repetition",
-                "Reviewing past mistakes",
-            ],
-            "explanation": "Shallow memorization leads to errors under variation.",
-        },
-        {
-            "stem": f"To boost retention for '{body}', you should:",
-            "correct": f"Connect it with {related_clean[0] if related_clean else 'its prerequisites'} and quiz yourself",
-            "distractors": [
-                "Avoid all practice questions",
-                "Rely only on highlights",
-                "Study unrelated chapters first",
-            ],
-            "explanation": "Linking related ideas plus self-testing improves recall.",
-        },
-        {
-            "stem": f"In assessments, '{body}' is most likely evaluated by asking you to:",
-            "correct": f"Apply {core} to a short scenario",
-            "distractors": [
-                "List unrelated trivia",
-                "Describe an unrelated field",
-                "Ignore given constraints",
-            ],
-            "explanation": "Assessments test applied understanding, not trivia.",
-        },
-    ]
-    generators.extend(extra_generators)
-
-    # Difficulty-flavored scenario/item
-    generators.append(
-        {
-            "stem": f"You need to apply '{body}' in a real case study. What should you focus on first?",
-            "correct": core,
-            "distractors": related_clean[:2] + _fallback_distractors(core),
-            "explanation": f"Start with the core element '{core}' to structure the solution.",
-        }
-    )
-
-    # Append difficulty-specific generators so they rotate into the selection loop
-    generators.extend(difficulty_profiles.get(difficulty.lower(), []))
-
-    questions: list[dict[str, Any]] = []
-    used_norm = set(used_questions or set())
-    seen_stems: set[str] = set()
-    idx = 0
-    attempts = 0
-    max_attempts = max(count * 6, 15)
-
-    while len(questions) < count and attempts < max_attempts:
-        attempts += 1
-        template = generators[idx % len(generators)]
-        idx += 1
-        stem = template["stem"]
-        norm = _normalize_question_text(stem)
-        if norm in used_norm:
-            continue
-        used_norm.add(norm)
-        questions.append(
-            _topic_grounded_mcq(
-                stem=stem,
-                correct=template["correct"],
-                distractors=template["distractors"],
-                explanation=template["explanation"],
-                order_index=len(questions),
-            )
-        )
-
-    # Guaranteed fill: rotate through varied stems instead of numbered "scenario" repeats.
-    fallback_templates = [
-        f"What is the key idea behind '{core}'?",
-        f"Which statement is true about '{core}' in practice?",
-        f"Which example best illustrates correct use of '{core}'?",
-        f"What is the first thing to check before applying '{core}'?",
-        f"What common mistake should you avoid when using '{core}'?",
-        f"Which option directly relates to '{core}'?",
-        f"Which prerequisite best supports learning '{core}'?",
-        f"Where would '{core}' be applied in a real system?",
-    ]
-    fb_idx = 0
-    while len(questions) < count:
-        stem = fallback_templates[fb_idx % len(fallback_templates)]
-        fb_idx += 1
-        questions.append(
-            _topic_grounded_mcq(
-                stem=stem,
-                correct=core,
-                distractors=_fallback_distractors(core),
-                explanation="Fallback variant to complete the quiz without duplicating stems.",
-                order_index=len(questions),
-            )
-        )
-
-    return questions
+    """Static quiz generation is disabled; quizzes must come from Groq."""
+    return []
 
 
 def _filter_and_backfill_questions(
@@ -556,10 +467,11 @@ def _filter_and_backfill_questions(
     allow_rule_backfill: bool = True,
     subject_name: str | None = None,
 ) -> list[dict]:
-    """Remove low-quality/off-topic/duplicate questions then backfill with rule-based ones to reach count."""
+    """Remove low-quality/off-topic/duplicate questions without static backfill."""
     filtered: list[dict] = []
     used = used_questions if used_questions is not None else set()
     seen: set[str] = set()
+    seen_leads: set[str] = set()
 
     for q in questions:
         qtext = q.get("question_text", "")
@@ -567,10 +479,17 @@ def _filter_and_backfill_questions(
             continue
         if not _is_question_on_topic(qtext, topic_name, subject_name):
             continue
+        if _is_generic_textbook_stem(qtext, topic_name, subject_name):
+            continue
         key = _normalize_question_text(qtext)
+        lead_key = _question_lead_signature(qtext)
         if key in seen or key in used:
             continue
+        if lead_key and lead_key in seen_leads:
+            continue
         seen.add(key)
+        if lead_key:
+            seen_leads.add(lead_key)
         used.add(key)
         q = dict(q)
         q["order_index"] = len(filtered)
@@ -591,6 +510,18 @@ def _filter_and_backfill_questions(
             key = _normalize_question_text(qtext)
             if key in seen_keys or key in used:
                 continue
+            if _is_low_quality_question(qtext):
+                continue
+            if _is_generic_textbook_stem(qtext, topic_name, subject_name):
+                continue
+            opts = (
+                str(item.get("option_a", "")),
+                str(item.get("option_b", "")),
+                str(item.get("option_c", "")),
+                str(item.get("option_d", "")),
+            )
+            if _has_bad_option(*opts):
+                continue
             seen_keys.add(key)
             used.add(key)
             ans = str(item.get("correct_answer", "A")).upper()
@@ -599,10 +530,10 @@ def _filter_and_backfill_questions(
             cleaned.append(
                 {
                     "question_text": qtext,
-                    "option_a": str(item.get("option_a", "")),
-                    "option_b": str(item.get("option_b", "")),
-                    "option_c": str(item.get("option_c", "")),
-                    "option_d": str(item.get("option_d", "")),
+                    "option_a": opts[0],
+                    "option_b": opts[1],
+                    "option_c": opts[2],
+                    "option_d": opts[3],
                     "correct_answer": ans,
                     "explanation": str(item.get("explanation", "")),
                     "order_index": len(cleaned),
@@ -614,15 +545,6 @@ def _filter_and_backfill_questions(
         if getattr(settings, "require_groq", False) and questions:
             # Groq-only mode: after filtering, fall back to deduped raw Groq items
             filtered.extend(_take_raw_groq_items(questions))
-        if allow_rule_backfill and len(filtered) < count:
-            backfill = _generate_contextual_rule_based_questions(
-                topic_name, difficulty, count - len(filtered), related_topics, used
-            )
-            for item in backfill:
-                item["order_index"] = len(filtered)
-                filtered.append(item)
-                if len(filtered) >= count:
-                    break
 
     return filtered
 
@@ -636,48 +558,25 @@ async def _generate_questions_with_llm(
     subject_name: str | None = None,
 ) -> list[dict]:
     """Generate quiz items using the configured provider."""
-    provider = (settings.ai_provider or "rule_based").lower()
-    require_groq = getattr(settings, "require_groq", False)
-
-    if provider == "rule_based":
-        # Prefer LLM if keys are available; otherwise, fail fast instead of returning static templates.
-        if settings.openai_api_key:
-            provider = "openai"
-        elif settings.groq_api_key:
-            provider = "groq"
-        else:
-            raise RuntimeError("AI provider not configured; set AI_PROVIDER=openai or groq and provide an API key")
-
-    if provider == "groq":
-        if not settings.groq_api_key:
-            raise RuntimeError("Groq API key is missing")
-        try:
-            return await _generate_questions_with_groq(
-                topic_name, difficulty, count, related_topics, used_questions, subject_name
-            )
-        except Exception:
-            if require_groq:
-                # Surface the error so the caller shows failure instead of silent fallback
-                raise
+    provider = (settings.ai_provider or "groq").lower()
+    if provider != "groq":
+        raise RuntimeError("Quiz generation is Groq-only. Set AI_PROVIDER=groq.")
+    if not settings.groq_api_key:
+        raise RuntimeError("Groq API key is missing")
+    allow_fallback = getattr(settings, "allow_groq_fallback", False)
+    try:
+        return await _generate_questions_with_groq(
+            topic_name, difficulty, count, related_topics, used_questions, subject_name
+        )
+    except Exception as exc:
+        if allow_fallback:
             logger.warning(
-                "Groq generation failed; falling back to rule-based because require_groq=False"
+                "Groq failed (%s); falling back to rule-based quiz generation", exc
             )
             return _generate_contextual_rule_based_questions(
                 topic_name, difficulty, count, related_topics, used_questions
             )
-
-    if provider == "openai":
-        if not settings.openai_api_key:
-            raise RuntimeError("OpenAI API key is missing")
-        return await _generate_questions_with_openai(
-            topic_name, difficulty, count, related_topics, used_questions, subject_name
-        )
-
-    if require_groq:
-        raise RuntimeError("require_groq=True but AI_PROVIDER is not 'groq'")
-
-    # No valid provider after checks
-    raise RuntimeError("AI provider not configured; set AI_PROVIDER=openai or groq and provide an API key")
+        raise
 
 
 async def _generate_questions_with_openai(
@@ -738,23 +637,17 @@ async def _generate_questions_with_openai(
             )
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
-    except Exception:
-        return _generate_contextual_rule_based_questions(
-            topic_name, difficulty, count, related_topics
-        )
+    except Exception as exc:
+        raise RuntimeError("OpenAI quiz generation failed") from exc
 
     match = re.search(r"\[.*\]", content, re.DOTALL)
     if not match:
-        return _generate_contextual_rule_based_questions(
-            topic_name, difficulty, count, related_topics
-        )
+        raise ValueError("OpenAI response missing JSON array of questions")
 
     try:
         parsed = json.loads(match.group(0))
     except json.JSONDecodeError:
-        return _generate_contextual_rule_based_questions(
-            topic_name, difficulty, count, related_topics
-        )
+        raise ValueError("OpenAI response JSON parse failed")
 
     formatted: list[dict] = []
     seen_questions: set[str] = set()
@@ -767,6 +660,8 @@ async def _generate_questions_with_openai(
         if _is_low_quality_question(qtext):
             continue
         if not _is_question_on_topic(qtext, topic_name, subject_name):
+            continue
+        if _is_generic_textbook_stem(qtext, topic_name, subject_name):
             continue
         opts = (
             str(item.get("option_a", "Option A")),
@@ -795,14 +690,6 @@ async def _generate_questions_with_openai(
         )
         if len(formatted) >= count:
             break
-
-    if len(formatted) < count:
-        fallback = _generate_contextual_rule_based_questions(
-            topic_name, difficulty, count - len(formatted), related_topics, used
-        )
-        for item in fallback:
-            item["order_index"] = len(formatted)
-            formatted.append(item)
 
     return formatted
 
@@ -848,10 +735,33 @@ async def _generate_questions_with_groq(
         "- Vary stems; no two stems should start the same way; avoid echoing the topic wording.\n"
         "- Each option must be short (<=18 words) and not a rephrasing of another option.\n"
         "- Correct answer should be non-obvious yet unambiguously correct.\n"
+        "- Do not wrap the JSON in markdown fences or add any prose before/after it.\n"
         "Return JSON array where each item has: question_text, option_a, option_b, option_c, option_d, "
         "correct_answer (A/B/C/D), explanation."
     )
 
+    def _extract_questions_from_content(content: str) -> list[dict]:
+        try:
+            parsed = _extract_json_payload(content)
+        except ValueError:
+            if not re.search(r"\[", content):
+                logger.warning("Groq content missing JSON array")
+                raise ValueError("Groq response missing JSON array of questions")
+            logger.warning("Groq JSON parse failed")
+            raise
+        if isinstance(parsed, dict):
+            for key in ("questions", "items", "data"):
+                nested = parsed.get(key)
+                if isinstance(nested, list):
+                    return nested
+            raise ValueError("Groq response JSON missing question array")
+        if not isinstance(parsed, list):
+            raise ValueError("Groq response JSON did not contain an array")
+        return parsed
+
+    parsed_questions: list[dict] | None = None
+    models_to_try = _groq_models_to_try()
+    MAX_ATTEMPTS = 2
     try:
         transport = (
             httpx.AsyncHTTPTransport(proxy=settings.groq_proxy_url)
@@ -866,92 +776,135 @@ async def _generate_questions_with_groq(
             transport=transport,
         ) as client:
             resp = None
-            for attempt in range(3):
-                resp = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.groq_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": settings.groq_model,
-                        "temperature": 0.4,
-                        "max_tokens": 800,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                    },
-                )
-                # Handle rate limits with short backoff
-                if resp.status_code == 429:
-                    retry_after = float(resp.headers.get("retry-after", "2"))
-                    wait = max(retry_after, 2 * (attempt + 1))
-                    logger.warning(
-                        "Groq rate limit (attempt %d), retrying in %.1fs: %s",
-                        attempt + 1,
-                        wait,
-                        resp.text,
+            for model_name in models_to_try:
+                for attempt in range(MAX_ATTEMPTS):
+                    resp = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {settings.groq_api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": model_name,
+                            "temperature": 0.4,
+                            "max_tokens": _groq_max_tokens_for_quiz(count),
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                        },
                     )
-                    if attempt == 2:
+                    if resp.status_code == 429:
+                        retry_hint = _extract_retry_hint(resp.text or "")
+                        logger.warning(
+                            "Groq rate limit for model=%s attempt=%d detail=%s",
+                            model_name,
+                            attempt + 1,
+                            resp.text,
+                        )
+                        if model_name != models_to_try[-1]:
+                            logger.info(
+                                "Trying fallback Groq model after rate limit on %s",
+                                model_name,
+                            )
+                            break
+                        if attempt == MAX_ATTEMPTS - 1:
+                            detail = f"Groq rate limit reached for model '{model_name}'"
+                            if retry_hint:
+                                detail = f"{detail}. Try again in {retry_hint}."
+                            raise RuntimeError(detail)
+                        retry_after = float(resp.headers.get("retry-after", "1.5"))
+                        wait = min(3.0, max(retry_after, 1.5 * (attempt + 1)))
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status_code >= 500:
+                        if attempt < MAX_ATTEMPTS - 1:
+                            logger.warning(
+                                "Groq transient error model=%s status=%s retrying: %s",
+                                model_name,
+                                resp.status_code,
+                                resp.text,
+                            )
+                            await asyncio.sleep(min(2.0, 1.0 * (attempt + 1)))
+                            continue
                         break
-                    await asyncio.sleep(wait)
-                    continue
-                # Retry transient 5xx once
-                if resp.status_code >= 500 and attempt < 2:
-                    logger.warning(
-                        "Groq transient error %s, retrying: %s", resp.status_code, resp.text
+
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if not data.get("choices"):
+                        logger.error("Groq response missing choices: %s", data)
+                        raise ValueError("Groq response missing choices array")
+                    content = data["choices"][0]["message"]["content"]
+                    logger.info(
+                        "Groq response received model=%s length=%d",
+                        model_name,
+                        len(content or ""),
                     )
-                    await asyncio.sleep(1.5 * (attempt + 1))
-                    continue
-                break
+                    try:
+                        parsed_questions = _extract_questions_from_content(content)
+                        break
+                    except ValueError as parse_exc:
+                        logger.warning(
+                            "Groq parse attempt %d failed for topic=%s model=%s: %s",
+                            attempt + 1,
+                            topic_name,
+                            model_name,
+                            parse_exc,
+                        )
+                        if attempt == MAX_ATTEMPTS - 1:
+                            raise
+                        await asyncio.sleep(0.5)
+                        continue
+                if parsed_questions is not None:
+                    break
 
             if resp is None:
                 raise RuntimeError("Groq did not return a response")
-
-            if resp.status_code == 429:
-                if getattr(settings, "require_groq", False):
-                    resp.raise_for_status()
-                else:
-                    raise RuntimeError("Groq rate limited")
-            resp.raise_for_status()
-            data = resp.json()
-            if not data.get("choices"):
-                logger.error("Groq response missing choices: %s", data)
-                raise ValueError("Groq response missing choices array")
-            content = data["choices"][0]["message"]["content"]
-            logger.info("Groq response received length=%d", len(content or ""))
+            if parsed_questions is None:
+                raise RuntimeError("Groq did not return a parsable response")
     except Exception as exc:
         body = None
+        status_code = None
         try:
             body = resp.text  # type: ignore[name-defined]
         except Exception:
             pass
+        try:
+            status_code = resp.status_code  # type: ignore[name-defined]
+        except Exception:
+            pass
         logger.exception("Groq quiz generation failed. Response body: %s", body)
-        raise RuntimeError("Groq quiz generation failed") from exc
-
-    match = re.search(r"\[.*\]", content, re.DOTALL)
-    if not match:
-        logger.warning("Groq content missing JSON array")
-        raise ValueError("Groq response missing JSON array of questions")
-
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        logger.warning("Groq JSON parse failed")
-        raise ValueError("Groq response JSON parse failed")
+        detail = "Groq quiz generation failed"
+        if status_code:
+            detail = f"{detail} (HTTP {status_code})"
+        if body:
+            compact_body = re.sub(r"\s+", " ", body).strip()
+            detail = f"{detail}: {compact_body[:240]}"
+        raise RuntimeError(detail) from exc
 
     formatted: list[dict] = []
     seen_questions: set[str] = set()
     used = used_questions or set()
-    for idx, item in enumerate(parsed):
+    reject_counts = {
+        "low_quality": 0,
+        "off_topic": 0,
+        "generic": 0,
+        "bad_options": 0,
+        "duplicate": 0,
+    }
+    for idx, item in enumerate(parsed_questions):
         answer = str(item.get("correct_answer", "A")).upper()
         if answer not in {"A", "B", "C", "D"}:
             answer = "A"
         qtext = str(item.get("question_text", f"Question on {topic_name}")).strip()
         if _is_low_quality_question(qtext):
+            reject_counts["low_quality"] += 1
             continue
         if not _is_question_on_topic(qtext, topic_name, subject_name):
+            reject_counts["off_topic"] += 1
+            continue
+        if _is_generic_textbook_stem(qtext, topic_name, subject_name):
+            reject_counts["generic"] += 1
             continue
         opts = (
             str(item.get("option_a", "Option A")),
@@ -960,9 +913,11 @@ async def _generate_questions_with_groq(
             str(item.get("option_d", "Option D")),
         )
         if _has_bad_option(*opts):
+            reject_counts["bad_options"] += 1
             continue
         key = _normalize_question_text(qtext)
         if key in seen_questions or key in used:
+            reject_counts["duplicate"] += 1
             continue
         seen_questions.add(key)
         used.add(key)
@@ -981,9 +936,17 @@ async def _generate_questions_with_groq(
         if len(formatted) >= count:
             break
 
+    logger.info(
+        "Groq quiz filter results topic=%s accepted=%d parsed=%d rejects=%s",
+        topic_name,
+        len(formatted),
+        len(parsed_questions),
+        reject_counts,
+    )
+
     if len(formatted) < count:
         # Prefer salvaging more Groq items (even if they failed earlier filters) before rule-based fill
-        for item in parsed:
+        for item in parsed_questions:
             if len(formatted) >= count:
                 break
             qtext = str(item.get("question_text", "")).strip()
@@ -1000,6 +963,12 @@ async def _generate_questions_with_groq(
             # Skip salvage items that still look like placeholders
             if not qtext or any(opt.lower().startswith("option") for opt in opts):
                 continue
+            if _is_low_quality_question(qtext):
+                continue
+            if _is_generic_textbook_stem(qtext, topic_name, subject_name):
+                continue
+            if _has_bad_option(*opts):
+                continue
             formatted.append(
                 {
                     "question_text": qtext or f"Question on {topic_name}",
@@ -1012,14 +981,6 @@ async def _generate_questions_with_groq(
                     "order_index": len(formatted),
                 }
             )
-
-        if len(formatted) < count and not getattr(settings, "require_groq", False):
-            fallback = _generate_contextual_rule_based_questions(
-                topic_name, difficulty, count - len(formatted), related_topics, used
-            )
-            for item in fallback:
-                item["order_index"] = len(formatted)
-                formatted.append(item)
 
     return formatted
 
@@ -1091,6 +1052,7 @@ async def create_quiz(db: AsyncSession, req: QuizGenerateRequest) -> Quiz:
     topic_name = topic.name
     subject = await db.get(Subject, topic.subject_id) if topic else None
     subject_name = subject.name if subject else None
+    llm_subject_name = subject_name if req.use_subject_context else None
     related_topics: list[str] = []
     if topic:
         related_q = (
@@ -1110,36 +1072,29 @@ async def create_quiz(db: AsyncSession, req: QuizGenerateRequest) -> Quiz:
     existing_result = await db.execute(existing_q)
     used_questions = {_normalize_question_text(q) for q in existing_result.scalars().all() if q}
 
-    quiz = Quiz(
-        user_id=req.user_id,
-        topic_id=req.topic_id,
-        difficulty=req.difficulty,
-        total_questions=req.num_questions,
-    )
-    db.add(quiz)
-    await db.flush()  # get quiz.id
-
-    # Prefer LLM generation, but fall back to rule-based generation so quiz entry points
-    # from schedule/subjects remain reliable even when the provider is unavailable.
+    # Groq-only generation: do not inject static question sets.
     attempts = 0
     questions_data: list[dict] = []
-    llm_failed = False
-    while len(questions_data) < req.num_questions and attempts < 3:
+    last_error: str | None = None
+    while len(questions_data) < req.num_questions and attempts < 2:
         remaining = req.num_questions - len(questions_data)
-        requested = max(remaining + 1, remaining)
+        requested = max(remaining + 2, remaining)
         try:
-            batch = await _generate_questions_with_llm(
-                topic_name,
-                req.difficulty,
-                requested,
-                related_topics,
-                used_questions,
-                subject_name,
+            batch = await asyncio.wait_for(
+                _generate_questions_with_llm(
+                    topic_name,
+                    req.difficulty,
+                    requested,
+                    related_topics,
+                    used_questions,
+                    llm_subject_name,
+                ),
+                timeout=_QUIZ_BATCH_TIMEOUT_SECS,
             )
-        except Exception:
-            llm_failed = True
+        except Exception as exc:
+            last_error = str(exc)
             logger.exception(
-                "LLM quiz generation failed for topic=%s difficulty=%s; will use fallback if needed",
+                "LLM quiz generation failed for topic=%s difficulty=%s",
                 topic_name,
                 req.difficulty,
             )
@@ -1154,35 +1109,38 @@ async def create_quiz(db: AsyncSession, req: QuizGenerateRequest) -> Quiz:
             used_questions=used_questions,
             questions=questions_data,
             allow_rule_backfill=False,
-            subject_name=subject_name,
+            subject_name=llm_subject_name,
         )
         used_questions = {_normalize_question_text(q["question_text"]) for q in questions_data}
         attempts += 1
 
-    if len(questions_data) < req.num_questions:
+    if len(questions_data) < req.num_questions and len(questions_data) < 3:
+        detail = f"Groq could not prepare enough valid quiz questions for '{topic_name}' ({len(questions_data)}/{req.num_questions})"
+        if last_error:
+            detail = f"{detail}. Last error: {last_error}"
+        raise RuntimeError(detail)
+
+    # Persist only after Groq generation succeeds so SQLite is not held open
+    # across long network calls.
+    actual_question_count = len(questions_data)
+    if actual_question_count < req.num_questions:
         logger.warning(
-            "Quiz fallback activated for topic=%s difficulty=%s generated=%d requested=%d llm_failed=%s",
+            "Proceeding with partial Groq quiz for topic=%s difficulty=%s count=%d requested=%d",
             topic_name,
             req.difficulty,
-            len(questions_data),
+            actual_question_count,
             req.num_questions,
-            llm_failed,
-        )
-        questions_data = _filter_and_backfill_questions(
-            topic_name=topic_name,
-            difficulty=req.difficulty,
-            count=req.num_questions,
-            related_topics=related_topics,
-            used_questions=used_questions,
-            questions=questions_data,
-            allow_rule_backfill=True,
-            subject_name=subject_name,
         )
 
-    if len(questions_data) < req.num_questions:
-        raise RuntimeError(
-            f"Could not generate enough quiz questions ({len(questions_data)}/{req.num_questions})"
-        )
+    quiz = Quiz(
+        user_id=req.user_id,
+        topic_id=req.topic_id,
+        difficulty=req.difficulty,
+        total_questions=actual_question_count,
+        included_in_progress=True,
+    )
+    db.add(quiz)
+    await db.flush()  # get quiz.id
 
     for qd in questions_data:
         q = QuizQuestion(quiz_id=quiz.id, **qd)
@@ -1241,28 +1199,26 @@ async def evaluate_quiz(db: AsyncSession, req: QuizSubmitRequest) -> QuizResult:
     difficulty = (quiz.difficulty or "medium").lower()
     threshold = PASS_THRESHOLDS.get(difficulty, PASS_THRESHOLDS["medium"])
     passed = score_pct >= threshold
-    await _record_quiz_performance(db, req.user_id, difficulty, score_pct)
+    include_in_progress = req.include_in_progress
+    quiz.included_in_progress = include_in_progress
+    if include_in_progress:
+        await _record_quiz_performance(db, req.user_id, difficulty, score_pct)
     next_quiz: Quiz | None = None
+    quiz_time_spent_mins = max(total * 3, 10) if total else 0
 
     topic = await db.get(Topic, quiz.topic_id)
     review_created = False
-    recommendation = "Good work. Continue with the next topic."
-
-    # Also record in progress
-    progress = ProgressRecord(
-        user_id=req.user_id,
-        topic_id=quiz.topic_id,
-        quiz_score=score_pct,
-        time_spent_mins=0,
-        completion_pct=topic.completion_pct if topic else 0,
-        notes=f"Quiz {difficulty} score: {round(score_pct, 1)}%",
+    recommendation = (
+        "Good work. Continue with the next topic."
+        if include_in_progress
+        else "Quiz score saved without changing study progress for this topic."
     )
-    db.add(progress)
 
-    if topic:
+    if topic and include_in_progress:
         topic.last_reviewed = datetime.now(timezone.utc)
+        topic.time_spent_mins += quiz_time_spent_mins
 
-    if not passed:
+    if include_in_progress and not passed:
         recommendation = (
             "Score below target. Read this topic again, then retake a quiz."
         )
@@ -1272,12 +1228,26 @@ async def evaluate_quiz(db: AsyncSession, req: QuizSubmitRequest) -> QuizResult:
         if topic:
             topic.completed = 0
             topic.completion_pct = max(topic.completion_pct - 10.0, 0.0)
-    elif topic and topic.completion_pct < 100:
-        topic.completion_pct = min(topic.completion_pct + 5.0, 100.0)
-        if topic.completion_pct >= 100:
-            topic.completed = 1
+    elif include_in_progress and topic and passed:
+        topic.completion_pct = 100.0
+        topic.completed = 1
+        # Auto-complete the pending schedule entry for this topic
+        pending_entry_q = (
+            select(ScheduleEntry)
+            .where(
+                ScheduleEntry.user_id == req.user_id,
+                ScheduleEntry.topic_id == quiz.topic_id,
+                ScheduleEntry.completed == 0,
+            )
+            .order_by(ScheduleEntry.scheduled_date, ScheduleEntry.start_time)
+            .limit(1)
+        )
+        pending_entry_result = await db.execute(pending_entry_q)
+        pending_entry = pending_entry_result.scalar_one_or_none()
+        if pending_entry:
+            pending_entry.completed = 1
 
-    if passed:
+    if include_in_progress and passed:
         next_difficulty = {
             "easy": "medium",
             "medium": "hard",
@@ -1315,6 +1285,30 @@ async def evaluate_quiz(db: AsyncSession, req: QuizSubmitRequest) -> QuizResult:
                 recommendation = (
                     "Good work. Score saved successfully. Generate the next level quiz manually."
                 )
+
+    if include_in_progress and (not passed or score_pct < 60):
+        try:
+            reflection = await AdaptiveAgent(db, req.user_id).run()
+            if reflection.schedule_entries_created > 0:
+                recommendation = (
+                    f"{recommendation} Your upcoming schedule was rescheduled to reinforce weaker areas."
+                )
+        except Exception:
+            logger.exception(
+                "Adaptive rescheduling failed after quiz evaluation for quiz %s",
+                quiz.id,
+            )
+
+    if include_in_progress:
+        progress = ProgressRecord(
+            user_id=req.user_id,
+            topic_id=quiz.topic_id,
+            quiz_score=score_pct,
+            time_spent_mins=quiz_time_spent_mins,
+            completion_pct=topic.completion_pct if topic else 0,
+            notes=f"Quiz {difficulty} score: {round(score_pct, 1)}%",
+        )
+        db.add(progress)
 
     await db.flush()
 
@@ -1370,4 +1364,3 @@ async def _record_quiz_performance(
             last_attempted=now,
         )
         db.add(perf)
-

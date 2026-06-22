@@ -19,9 +19,9 @@ from backend.app.services.quiz_engine import create_quiz
 from backend.app.schemas.progress import ProgressUpdate, ProgressDashboard
 
 PASS_THRESHOLDS = {
-    "easy": 60.0,
-    "medium": 70.0,
-    "hard": 80.0,
+    "easy": 75.0,
+    "medium": 75.0,
+    "hard": 75.0,
 }
 
 
@@ -65,6 +65,8 @@ async def get_dashboard(db: AsyncSession, user_id: str) -> ProgressDashboard:
     completed = sum(1 for t in topics if t.completed)
     overall_pct = sum(t.completion_pct for t in topics) / total if total else 0.0
     total_time = sum(t.time_spent_mins for t in topics)
+    topics_covered = [t.name for t in topics if t.completed or t.completion_pct >= 100][:8]
+    topic_names = {topic.id: topic.name for topic in topics}
 
     # Average quiz score from progress records
     score_q = select(func.avg(ProgressRecord.quiz_score)).where(
@@ -79,19 +81,57 @@ async def get_dashboard(db: AsyncSession, user_id: str) -> ProgressDashboard:
     quiz_q = select(Quiz).where(
         Quiz.user_id == user_id,
         Quiz.score.isnot(None),
+        Quiz.included_in_progress.is_(True),
     )
     quiz_result = await db.execute(quiz_q)
     quizzes = list(quiz_result.scalars().all())
     by_topic: dict[str, int] = {}
+    topic_scores: dict[str, list[float]] = {}
     passed_quizzes = 0
     for quiz in quizzes:
+        difficulty = (quiz.difficulty or "medium").lower()
         threshold = PASS_THRESHOLDS.get(
-            (quiz.difficulty or "medium").lower(),
+            difficulty,
             PASS_THRESHOLDS["medium"],
         )
         if (quiz.score or 0) >= threshold:
             passed_quizzes += 1
             by_topic[quiz.topic_id] = by_topic.get(quiz.topic_id, 0) + 1
+        if quiz.score is not None:
+            topic_scores.setdefault(quiz.topic_id, []).append(float(quiz.score))
+
+    weak_topics: list[str] = []
+    topic_quiz_averages: list[dict] = []
+    for topic in topics:
+        scores = topic_scores.get(topic.id, [])
+        if not scores:
+            continue
+        average = sum(scores) / len(scores)
+        topic_quiz_averages.append(
+            {
+                "topic_id": topic.id,
+                "topic_name": topic.name,
+                "average_score": round(average, 1),
+                "attempts": len(scores),
+                "completion_pct": round(float(topic.completion_pct or 0.0), 1),
+            }
+        )
+        if average < 75.0 and not topic.completed:
+            weak_topics.append(f"{topic.name} ({round(average, 1)}%)")
+
+    topic_quiz_averages.sort(
+        key=lambda item: (item["average_score"], -item["attempts"], item["topic_name"].lower())
+    )
+
+    not_started_topics = sum(1 for topic in topics if (topic.completion_pct or 0) <= 0)
+    in_progress_topics = sum(
+        1 for topic in topics if 0 < (topic.completion_pct or 0) < 100 and not topic.completed
+    )
+    topic_status_breakdown = [
+        {"name": "Completed", "value": completed},
+        {"name": "In progress", "value": in_progress_topics},
+        {"name": "Not started", "value": not_started_topics},
+    ]
 
     schedule_q = select(ScheduleEntry).where(ScheduleEntry.user_id == user_id)
     schedule_result = await db.execute(schedule_q)
@@ -120,12 +160,16 @@ async def get_dashboard(db: AsyncSession, user_id: str) -> ProgressDashboard:
         completed_topics=completed,
         overall_completion_pct=round(overall_pct, 1),
         total_time_spent_mins=round(total_time, 1),
-        average_quiz_score=round(avg_score, 1) if avg_score else None,
+        average_quiz_score=round(avg_score, 1) if avg_score is not None else None,
         total_schedule_entries=total_schedule_entries,
         completed_schedule_entries=completed_schedule_entries,
         total_quizzes_taken=len(quizzes),
         quizzes_passed=passed_quizzes,
-        weak_topics=[],
+        quizzes_failed=max(len(quizzes) - passed_quizzes, 0),
+        weak_topics=weak_topics[:8],
+        topics_covered=topics_covered,
         upcoming_topics=upcoming,
         mastery_pending=mastery_pending,
+        topic_status_breakdown=topic_status_breakdown,
+        topic_quiz_averages=topic_quiz_averages[:8],
     )

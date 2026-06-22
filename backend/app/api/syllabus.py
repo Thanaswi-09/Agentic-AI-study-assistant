@@ -57,212 +57,10 @@ _TOPIC_SEP_PATTERN = re.compile(r"\s*(?:;|\||\u2022)\s*")
 _UNIT_ONLY_PATTERN = re.compile(r"^\s*Unit\s*-?\s*([IVXLC\d]+)\s*$", re.IGNORECASE)
 _COURSE_CODE_TOKEN_PATTERN = re.compile(r"\b[A-Z]{1,4}\d{3}[A-Z]{0,4}\b", re.IGNORECASE)
 _COURSE_CODE_PREFIX_PATTERN = re.compile(r"^\s*[A-Z]{1,4}\d{3}[A-Z]{0,4}\s*[-:]\s*", re.IGNORECASE)
+_BROKEN_COURSE_CODE_PATTERN = re.compile(r"\b[a-z]\s*\d{2,3}\s*[a-z](?:\s*[a-z])?\b", re.IGNORECASE)
 _NOISE_TOPIC_EXACT = {"nit02"}
 _NOISE_TOPIC_BODY_EXACT = {"a", "j", "np", "11 x", "802", "0/1"}
-_NOISE_SINGLE_WORD_BODIES = {
-    "information",
-    "application",
-    "applications",
-    "database",
-    "databases",
-    "item",
-    "items",
-    "structure",
-    "structures",
-    "tech",
-    "education",
-    "title",
-    "ltd",
-    "conventional",
-    "international",
-    "julia",
-    "julie",
-    "meira",
-    "tan",
-    "tiwary",
-    "kowalski",
-    "maybury",
-    "manning",
-    "raghavan",
-    "schutze",
-    "maheshwari",
-    "mithani",
-    "solvency",
-    "algorithms",
-}
-_ALLOWED_SINGLE_WORD_BODIES = {
-    "introduction",
-    "basics",
-    "sensing",
-    "actuation",
-    "hypertext",
-    "agriculture",
-    "healthcare",
-    "retrieval",
-    "classification",
-    "overfitting",
-    "regression",
-    "logistic",
-    "production",
-    "cost",
-    "solvency",
-}
-_FRAGMENT_ENDINGS = {"and", "of", "to", "for", "with", "or", "amp", "etc", "application", "applications"}
-_NOISE_TOPIC_PHRASES = {
-    "pre requisite",
-    "pre - requisite",
-    "prerequisite",
-    "syllabus",
-    "course outcome",
-    "course outcomes",
-    "course description",
-    "cse ai ml syllabus",
-    "reference books",
-    "text books",
-    "text book",
-    "reference book",
-    "student s handbook",
-    "course title",
-    "lt pcredits",
-    "ltpcredits",
-    "open elective",
-    "professional elective",
-    "book house",
-    "himalaya publishing",
-    "stan ford",
-    "univ",
-    "after completion of this course",
-    "after completion of thiscourse",
-    "students will be able to",
-    "studentswill be ableto",
-    "objectives of the course",
-    "the objectives of the course",
-    "objectives of thecourse",
-    "course are to understand",
-    "courseare to understand",
-    "be able to",
-    "students will be ableto",
-    "be ableto",
-    "develop a clear comprehension",
-    "gain expertise",
-    "understanding of data handling",
-    "understanding of datahandling",
-    "software defined networking",
-    "fundamentals of iot",
-    "introduction to information retrieval",
-    "construction of iot applications",
-    "ii year ii semester",
-    "il year il semester",
-    "contains supervised and unsupervised models",
-    "search methods and visualization techniques",
-    "language processing applications",
-    "inlationus",
-    "markttucture",
-    "monolyligopolyonplist",
-}
-_BOOKISH_HINTS = {
-    "mc graw",
-    "mcgraw",
-    "wiley",
-    "pearson",
-    "cambridge",
-    "oxford",
-    "press",
-    "publication",
-    "publications",
-    "publishers",
-    "edition",
-    "tata",
-    "morgan kaufmann",
-    "oreilly",
-    "geethika",
-    "ghosh",
-    "piyali",
-    "roy choudhury",
-    "chaturvedi",
-    "gupta",
-    "frakes",
-    "baeza",
-    "leskovec",
-    "ullman",
-    "maheswaran",
-    "maheshwaran",
-    "rajaraman",
-    "ilinsky",
-    "dhanesh",
-    "khatri",
-    "maheshwari",
-    "mithani",
-    "siddiqui",
-    "zitouni",
-    "bikel",
-    "manning",
-    "raghavan",
-    "schutze",
-    "kowalski",
-    "maybury",
-    "prentice hall",
-    "gerald",
-    "mark t",
-    "paresh shah",
-    "kumar",
-    "zaki",
-    "daniel",
-    "steinbach",
-    "ste inbach",
-}
-_NOISE_TOPIC_PREFIXES = (
-    "course title",
-    "ii year",
-    "iii year",
-    "lt pcredits",
-    "ltpcredits",
-    "open elective",
-    "professional elective",
-)
-_FRAGMENT_STARTERS = {"of", "and", "to", "for", "in", "with", "by", "on", "from"}
-_SAFE_TITLE_WORDS = {
-    "advanced",
-    "analytics",
-    "basics",
-    "concepts",
-    "concept",
-    "design",
-    "economics",
-    "hypertext",
-    "indexing",
-    "introduction",
-    "language",
-    "linkages",
-    "management",
-    "modeling",
-    "processing",
-    "retrieval",
-    "revision",
-    "structures",
-    "systems",
-    "techniques",
-    "themes",
-    "topics",
-    "visualization",
-}
-_BROKEN_COURSE_CODE_PATTERN = re.compile(r"\b[a-z]\s*\d{2,3}\s*[a-z](?:\s*[a-z])?\b", re.IGNORECASE)
-_OUTCOME_VERB_PATTERN = re.compile(
-    r"\b(?:apply|analyze|build|develop|explore|evaluate|gain|demonstrate|understand|construct|carry out|comprehend|examine|achieve)\b",
-    re.IGNORECASE,
-)
-_TECHNICAL_TOPIC_HINTS = {
-    "regression",
-    "time series",
-    "learning models",
-    "objective segmentation",
-    "language models",
-    "performance",
-    "probability",
-    "statistics",
-    "pricing",
-    "economics",
-}
+
 _UNICODE_ROMAN_MAP = str.maketrans({
     "\u2160": "I",
     "\u2161": "II",
@@ -383,14 +181,23 @@ def _is_valid_topic_text(topic_name: str, subject_name: str | None = None) -> bo
     title_words = re.findall(r"[A-Za-z]+", body_text)
     if (
         re.fullmatch(r"[A-Z][a-z]+(?:\s+[A-Z])?(?:\s+[A-Z][a-z]+)", body_text)
-        and not any(word.lower() in _SAFE_TITLE_WORDS for word in title_words)
+        and not any(
+            re.search(
+                r"(data|network|design|analysis|learning|systems?|algorithms?|database|retrieval|language|programming|structures|economics|financial|management|security|internet|cloud|mining|theory)",
+                word.lower(),
+            )
+            for word in title_words
+        )
     ):
         return False
     body = body_text.lower()
     if body in _NOISE_TOPIC_BODY_EXACT:
         return False
     normalized_body = re.sub(r"[^a-z0-9]+", " ", body).strip()
-    if any(phrase in normalized_body for phrase in _NOISE_TOPIC_PHRASES):
+    if re.search(
+        r"\b(model question paper|question bank|text ?book|reference books?|course outcomes?|learning outcomes?|recommended books?)\b",
+        normalized_body,
+    ):
         return False
     if re.search(r"(?:https?://|www\.|\.edu\b|@)", lower):
         return False
@@ -402,11 +209,11 @@ def _is_valid_topic_text(topic_name: str, subject_name: str | None = None) -> bo
         return False
     if _BROKEN_COURSE_CODE_PATTERN.search(text):
         return False
-    if body.startswith(_NOISE_TOPIC_PREFIXES):
+    if re.match(r"^(course outcomes?|learning outcomes?|text ?book|reference books?)\b", body):
         return False
     if re.search(r"\btextbooks?\b|\breference books?\b", body):
         return False
-    if any(hint in normalized_body for hint in _BOOKISH_HINTS):
+    if re.search(r"\b(author|authors|publisher|publishers|edition|isbn|mcgraw|pearson|wiley|oxford|cambridge)\b", normalized_body):
         return False
     if re.search(r"\b(?:pvt|ltd|edition|isbn|publishers?|university|college|hyderabad)\b", normalized_body):
         return False
@@ -414,15 +221,24 @@ def _is_valid_topic_text(topic_name: str, subject_name: str | None = None) -> bo
         return False
     if (
         len(body_words := [w for w in re.split(r"\s+", re.sub(r"[^A-Za-z0-9 ]", " ", body)) if w]) >= 7
-        and _OUTCOME_VERB_PATTERN.search(normalized_body)
-        and not any(hint in normalized_body for hint in _TECHNICAL_TOPIC_HINTS)
+        and re.search(r"\b(understand|learn|identify|explain|describe|apply|analyze|analyse|evaluate|design|implement)\b", normalized_body)
+        and not re.search(
+            r"\b(algorithm|algorithms|protocol|protocols|database|network|networks|system|systems|language|languages|retrieval|analytics|economics|financial|programming|stack|queue|tree|graph|nlp|iot|sdn)\b",
+            normalized_body,
+        )
     ):
         return False
     if (
         3 <= len(body_words) <= 5
         and "and" in {word.lower() for word in body_words}
         and all(word.lower() == "and" or word[:1].isupper() for word in body_words)
-        and not any(word.lower() in _SAFE_TITLE_WORDS for word in body_words)
+        and not any(
+            re.search(
+                r"(data|network|design|analysis|learning|systems?|algorithms?|database|retrieval|language|programming|structures|economics|financial|management|security|internet|cloud|mining|theory)",
+                word.lower(),
+            )
+            for word in body_words
+        )
     ):
         return False
     if re.fullmatch(r"[\d\W_]+", body):
@@ -438,18 +254,8 @@ def _is_valid_topic_text(topic_name: str, subject_name: str | None = None) -> bo
         return False
     if len(body_words) == 1:
         word = body_words[0].lower()
-        if word in _NOISE_SINGLE_WORD_BODIES:
-            return False
-        if word not in _ALLOWED_SINGLE_WORD_BODIES:
-            return False
-    if len(body_words) < 2 and body_words[0].lower() in _NOISE_SINGLE_WORD_BODIES:
-        return False
-    if body_words[0].lower() in _FRAGMENT_STARTERS:
-        return False
-    if body_words[0].lower() in {"of", "and", "to", "for", "in", "with", "by", "on"} and len(body_words) < 4:
-        return False
-    if body_words[-1].lower() in _FRAGMENT_ENDINGS and len(body_words) <= 6:
-        return False
+       
+    
     if len(body_words) >= 12 and re.search(
         r"\b(this|also|covers|apply|analyze|develop|examine|comprehend|explore|build|evaluate|carry out)\b",
         normalized_body,
@@ -533,23 +339,8 @@ def _humanize_topic_text(text: str) -> str:
     cleaned = humanize_topic_text(text)
     cleaned = (
         cleaned.replace("．", ".")
-        .replace("。", ".")
-        .replace("｡", ".")
-        .replace("：", ":")
-        .replace("（", "(")
-        .replace("）", ")")
-        .replace("•", ".")
-        .replace("·", ".")
     )
-    substitutions = (
-        (r"\bBayesiantopicbased\b", "Bayesian topic based"),
-        (r"\bofword senses\b", "of word senses"),
-        (r"\bforprediction\b", "for prediction"),
-        (r"\bConcep\s+tof\b", "Concept of"),
-        (r"SDN\)\s*SDN", "SDN) SDN"),
-    )
-    for pattern, replacement in substitutions:
-        cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
+      
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip(" .,-")
 
@@ -643,7 +434,7 @@ def _split_topic_candidates(raw_topic: str) -> list[str]:
         if ":" in p:
             head, tail = p.split(":", 1)
             normalized_head = re.sub(r"[^a-z0-9]+", " ", head.lower()).strip()
-            if any(hint in normalized_head for hint in _BOOKISH_HINTS):
+            if re.search(r"\b(author|authors|publisher|publishers|edition|isbn|mcgraw|pearson|wiley|oxford|cambridge)\b", normalized_head):
                 continue
             if len(head.split()) <= 4 and len(tail.split()) >= 2:
                 p = tail.strip()
@@ -657,16 +448,8 @@ def _split_topic_candidates(raw_topic: str) -> list[str]:
             and any(len(x.split()) >= 2 for x in comma_parts)
         )
         protected_two_part_phrase = (
-            re.search(r"\bwords?\s+and\s+their\s+components\b", first_part, re.IGNORECASE)
-            or (
-                len(comma_parts) >= 2
-                and re.search(r"\bprogramming\b", first_part, re.IGNORECASE)
-                and re.search(r"\bintegration\b", second_part, re.IGNORECASE)
-            )
-            or (
-                len(comma_parts) >= 2
-                and re.search(r"\bissues?\b|\bchallenges?\b", second_part, re.IGNORECASE)
-            )
+            re.search(r"\bwords", first_part, re.IGNORECASE)
+            
         )
         should_split_two = (
             len(comma_parts) == 2

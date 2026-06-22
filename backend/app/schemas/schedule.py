@@ -21,7 +21,7 @@ class ScheduleGenerateRequest(BaseModel):
 class ScheduleEntryOut(BaseModel):
     id: str
     user_id: str
-    topic_id: str
+    topic_id: str | None = None
     subject_name: str
     topic_name: str
     scheduled_date: date
@@ -31,7 +31,7 @@ class ScheduleEntryOut(BaseModel):
     priority_score: float
     is_revision: int
     completed: int
-    created_at: datetime
+    created_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 

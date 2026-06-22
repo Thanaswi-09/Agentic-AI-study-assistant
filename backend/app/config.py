@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from functools import lru_cache
 
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,8 +37,10 @@ class Settings(BaseSettings):
     openai_proxy_url: str = ""
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
+    groq_fallback_models: str = ""
     groq_proxy_url: str = ""
     require_groq: bool = False
+    allow_groq_fallback: bool = False
 
     # Voice
     voice_enabled: bool = True
@@ -46,6 +48,36 @@ class Settings(BaseSettings):
 
     # Notifications
     notification_enabled: bool = True
+
+    # Email
+    smtp_host: str = Field(
+        default="smtp.gmail.com",
+        validation_alias=AliasChoices("smtp_host", "spring.mail.host"),
+    )
+    smtp_port: int = Field(
+        default=587,
+        validation_alias=AliasChoices("smtp_port", "spring.mail.port"),
+    )
+    smtp_username: str = Field(
+        default="",
+        validation_alias=AliasChoices("smtp_username", "spring.mail.username"),
+    )
+    smtp_password: str = Field(
+        default="",
+        validation_alias=AliasChoices("smtp_password", "spring.mail.password"),
+    )
+    smtp_use_tls: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("smtp_use_tls", "spring.mail.properties.mail.smtp.starttls.enable"),
+    )
+    mail_from_name: str = Field(
+        default="Study Assistant",
+        validation_alias=AliasChoices("mail_from_name", "spring.mail.from-name"),
+    )
+    mail_from_email: str = Field(
+        default="",
+        validation_alias=AliasChoices("mail_from_email", "spring.mail.from"),
+    )
 
     @field_validator("debug", mode="before")
     @classmethod
@@ -71,6 +103,14 @@ class Settings(BaseSettings):
             return value
         absolute = (_PROJECT_ROOT / db_path[2:]).resolve()
         return f"{prefix}{absolute.as_posix()}"
+
+    @property
+    def email_enabled(self) -> bool:
+        return bool(self.smtp_username and self.smtp_password)
+
+    @property
+    def effective_mail_from_email(self) -> str:
+        return self.mail_from_email or self.smtp_username
 
 
 @lru_cache

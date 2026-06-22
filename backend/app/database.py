@@ -6,7 +6,7 @@ import asyncio
 
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import DeclarativeBase
 
 from backend.app.config import get_settings
@@ -21,7 +21,7 @@ engine = create_async_engine(
     echo=settings.debug,
     future=True,
     connect_args={"timeout": 60} if IS_SQLITE else {},
-    poolclass=NullPool if IS_SQLITE else None,
+    poolclass=StaticPool if IS_SQLITE else None,
 )
 
 async_session_factory = async_sessionmaker(
@@ -148,5 +148,14 @@ async def _run_sqlite_compat_migrations(conn) -> None:
             await conn.execute(
                 text(
                     "ALTER TABLE users ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP"
+                )
+            )
+    if "quizzes" in tables:
+        cols_result = await conn.execute(text("PRAGMA table_info(quizzes)"))
+        columns = {row[1] for row in cols_result}
+        if "included_in_progress" not in columns:
+            await conn.execute(
+                text(
+                    "ALTER TABLE quizzes ADD COLUMN included_in_progress BOOLEAN DEFAULT 1"
                 )
             )

@@ -11,6 +11,7 @@ class QuizGenerateRequest(BaseModel):
     topic_id: str
     difficulty: str = Field("medium")  # easy, medium, hard
     num_questions: int = Field(5, ge=1, le=20)
+    use_subject_context: bool = True
 
 
 class QuizQuestionOut(BaseModel):
@@ -47,6 +48,7 @@ class QuizSubmitRequest(BaseModel):
     quiz_id: str
     user_id: str
     answers: list[QuizAnswerItem]
+    include_in_progress: bool = True
 
 
 class QuizResult(BaseModel):

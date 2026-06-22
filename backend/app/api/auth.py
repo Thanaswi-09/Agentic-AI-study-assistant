@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import secrets
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +14,7 @@ from backend.app.database import get_db
 from backend.app.models.auth import AuthCredential
 from backend.app.models.user import User
 from backend.app.schemas.auth import RegisterRequest, LoginRequest, AuthResponse
+from backend.app.services.email_service import send_welcome_email
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -25,7 +26,11 @@ def _hash_password(password: str, salt: str) -> str:
 
 
 @router.post("/register", response_model=AuthResponse, status_code=201)
-async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(
+    payload: RegisterRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
     """Create a login credential + user profile."""
     email = payload.email.strip().lower()
 
@@ -67,6 +72,7 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     )
     await db.flush()
     await db.refresh(user)
+    background_tasks.add_task(send_welcome_email, user)
 
     return {"user": user}
 

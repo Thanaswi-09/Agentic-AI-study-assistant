@@ -26,6 +26,7 @@ from backend.app.api.voice import router as voice_router
 from backend.app.api.auth import router as auth_router
 from backend.app.api.syllabus import router as syllabus_router
 from backend.app.api.chat import router as chat_router
+from backend.app.api.mind_map import router as mind_map_router
 
 settings = get_settings()
 
@@ -74,6 +75,7 @@ app.include_router(voice_router)
 app.include_router(auth_router)
 app.include_router(syllabus_router)
 app.include_router(chat_router)
+app.include_router(mind_map_router)
 
 
 @app.get("/", tags=["health"])

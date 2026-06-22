@@ -85,7 +85,6 @@ async def ready_topic_for_quizzes(
         topic.completed = 1
         topic.completion_pct = 100.0
         topic.last_reviewed = datetime.now(timezone.utc)
-        await db.flush()
 
         difficulties = ["easy", "medium", "hard"]
         quizzes: list[QuizOut] = []
@@ -108,5 +107,6 @@ async def ready_topic_for_quizzes(
     except HTTPException:
         raise
     except Exception:
+        await db.rollback()
         logger.exception("Ready-quizzes generation hard-failed for topic %s", topic_id)
         return TopicReadyQuizOut(topic_id=topic_id, quizzes=[])

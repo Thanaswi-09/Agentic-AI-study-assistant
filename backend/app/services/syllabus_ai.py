@@ -104,6 +104,70 @@ def looks_too_sparse_for_schedule(
     return False
 
 
+async def correct_topic_spellings(
+    subjects: list[dict[str, list[str]]],
+) -> list[dict[str, list[str]]]:
+    """Use the LLM to fix spelling mistakes in extracted topic names."""
+    base_url, api_key, model = _provider_config()
+    if not base_url or not api_key or not model:
+        return subjects
+
+    topics_flat = []
+    for s in subjects:
+        for t in s.get("topics", []):
+            topics_flat.append(t)
+
+    if not topics_flat:
+        return subjects
+
+    topics_json = json.dumps(topics_flat)
+
+    system_prompt = (
+        "You are a spelling corrector for academic syllabus topic names. "
+        "Fix only clear spelling mistakes. Do not rephrase, reorder, or change meaning. "
+        "Return only valid JSON — a list of corrected strings in the same order."
+    )
+    user_prompt = (
+        f"Fix spelling mistakes in these topic names and return a JSON array in the same order:\n{topics_json}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                base_url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.0,
+                },
+            )
+        response.raise_for_status()
+        data = response.json()
+        content = str(data["choices"][0]["message"]["content"] or "")
+        corrected = json.loads(re.search(r"\[.*\]", content, re.DOTALL).group(0))
+        if not isinstance(corrected, list) or len(corrected) != len(topics_flat):
+            return subjects
+    except Exception:
+        return subjects
+
+    idx = 0
+    result = []
+    for s in subjects:
+        new_topics = []
+        for _ in s.get("topics", []):
+            new_topics.append(str(corrected[idx]).strip())
+            idx += 1
+        result.append({"name": s["name"], "topics": new_topics})
+    return result
+
+
 async def extract_subjects_and_topics_with_llm(
     text: str,
     *,

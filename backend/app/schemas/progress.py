@@ -39,6 +39,10 @@ class ProgressDashboard(BaseModel):
     completed_schedule_entries: int = 0
     total_quizzes_taken: int = 0
     quizzes_passed: int = 0
+    quizzes_failed: int = 0
     weak_topics: list[str]
+    topics_covered: list[str] = []
     upcoming_topics: list[str]
     mastery_pending: list[dict] = []
+    topic_status_breakdown: list[dict] = []
+    topic_quiz_averages: list[dict] = []

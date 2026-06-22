@@ -46,7 +46,7 @@ export default function Profile() {
   const sessionMins = 60;
   const breakMins = 15;
   const maxTopicsPerDay = null;
-  const noAiMode = true;
+  const noAiMode = false;
   const [previewSubjects, setPreviewSubjects] = useState([]);
   const [previewReady, setPreviewReady] = useState(false);
   const [isPreviewing, setIsPreviewing] = useState(false);
@@ -313,7 +313,7 @@ export default function Profile() {
             </span>
             <h1 className="profile-title">{name || profile?.name || 'Study Profile'}</h1>
             <p className="profile-subtitle">
-              Keep your study settings, syllabus import flow, and timetable overview together in one clean workspace.
+              Keep your study settings, AI-assisted syllabus workflow, and study timetable together in one clean workspace.
             </p>
             {profile && (
               <div className="profile-email-row">
@@ -434,7 +434,7 @@ export default function Profile() {
                 <FileText size={16} />
                 <div>
                   <strong>Preview First</strong>
-                  <span>Check extracted subjects and topic lines before generation.</span>
+                  <span>Review extracted subjects and topic lines before building the plan.</span>
                 </div>
               </div>
               <div className="profile-chip">
@@ -447,8 +447,8 @@ export default function Profile() {
               <div className="profile-chip">
                 <ShieldCheck size={16} />
                 <div>
-                  <strong>Reset Available</strong>
-                  <span>Clear old study data before building a fresh plan.</span>
+                  <strong>AI Assisted</strong>
+                  <span>Use Groq-assisted parsing instead of static fallback content.</span>
                 </div>
               </div>
             </div>

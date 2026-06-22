@@ -117,9 +117,12 @@ class AdaptiveAgent:
         )
         obs.days_until_next_exam = nearest_exam_days
 
+        weak_topic_ids: set[str] = set()
+
         # Weak topics: low completion AND high difficulty
         for t in all_topics:
             if t.completion_pct < 40 and t.difficulty >= 0.5:
+                weak_topic_ids.add(t.id)
                 obs.weak_topics.append({"id": t.id, "name": t.name, "completion": t.completion_pct})
 
         # Overdue: scheduled entries in the past that are not completed
@@ -141,6 +144,39 @@ class AdaptiveAgent:
         avg_result = await self.db.execute(score_q)
         obs.avg_quiz_score = avg_result.scalar()
 
+        recent_progress_q = (
+            select(ProgressRecord)
+            .where(
+                ProgressRecord.user_id == self.user_id,
+                ProgressRecord.quiz_score.isnot(None),
+            )
+            .order_by(ProgressRecord.recorded_at.desc())
+            .limit(30)
+        )
+        recent_progress_result = await self.db.execute(recent_progress_q)
+        recent_progress = list(recent_progress_result.scalars().all())
+        topics_by_id = {topic.id: topic for topic in all_topics}
+        weak_quiz_scores: dict[str, list[float]] = {}
+        for record in recent_progress:
+            if record.topic_id and record.quiz_score is not None and record.quiz_score < 60:
+                weak_quiz_scores.setdefault(record.topic_id, []).append(float(record.quiz_score))
+
+        for topic_id, scores in weak_quiz_scores.items():
+            if topic_id in weak_topic_ids:
+                continue
+            topic = topics_by_id.get(topic_id)
+            if not topic:
+                continue
+            weak_topic_ids.add(topic_id)
+            obs.weak_topics.append(
+                {
+                    "id": topic.id,
+                    "name": topic.name,
+                    "completion": topic.completion_pct,
+                    "avg_quiz_score": round(sum(scores) / len(scores), 1),
+                }
+            )
+
         self.observation = obs
         logger.info("Agent OBSERVE complete for user %s", self.user_id)
         return obs
@@ -153,32 +189,31 @@ class AdaptiveAgent:
         obs = self.observation
         plan = Plan()
 
-        # Rule 1: If weak topics exist, boost them
+        # Rule 1: Weak topics should be prioritised, but not reshuffle the whole plan
         if obs.weak_topics:
             plan.boost_topics = [t["id"] for t in obs.weak_topics]
             plan.messages.append(
-                f"Detected {len(obs.weak_topics)} weak topic(s) — increasing study allocation."
+                f"Detected {len(obs.weak_topics)} weak topic(s) - increasing their future priority."
             )
             plan.suggested_quizzes = plan.boost_topics[:3]
 
-        # Rule 2: If overdue items exist, reschedule
+        # Rule 2: Only overdue unfinished sessions should trigger a rebuild
         if obs.overdue_topics:
             plan.reschedule = True
             plan.messages.append(
-                f"{len(obs.overdue_topics)} overdue session(s) detected — rescheduling."
+                f"{len(obs.overdue_topics)} overdue session(s) detected - moving unfinished work into today and the next available days."
             )
 
-        # Rule 3: If exams are imminent (< 7 days), reschedule aggressively
+        # Rule 3: Exams coming up soon should tighten focus, but not rebuild the plan by themselves
         if obs.days_until_next_exam is not None and obs.days_until_next_exam <= 7:
-            plan.reschedule = True
             plan.messages.append(
-                f"Exam in {obs.days_until_next_exam} day(s) — switching to intensive mode."
+                f"Exam in {obs.days_until_next_exam} day(s) - keeping upcoming sessions focused."
             )
 
-        # Rule 4: If average quiz score is low, suggest more quizzes
+        # Rule 4: Low quiz scores should suggest more practice without reshuffling everything
         if obs.avg_quiz_score is not None and obs.avg_quiz_score < 60:
             plan.messages.append(
-                "Average quiz score is below 60 % — recommending more practice quizzes."
+                "Average quiz score is below 60 % - recommending more practice quizzes."
             )
 
         # Rule 5: If overall progress is high, suggest revision
@@ -209,14 +244,14 @@ class AdaptiveAgent:
 
         # Regenerate schedule if needed
         if plan.reschedule:
-            # Remove future incomplete entries
+            # Rebuild the plan from today by clearing all pending entries,
+            # including overdue ones left in the past.
             today = date.today()
-            future_q = select(ScheduleEntry).where(
+            pending_q = select(ScheduleEntry).where(
                 ScheduleEntry.user_id == self.user_id,
-                ScheduleEntry.scheduled_date >= today,
                 ScheduleEntry.completed == 0,
             )
-            result = await self.db.execute(future_q)
+            result = await self.db.execute(pending_q)
             for entry in result.scalars().all():
                 await self.db.delete(entry)
 
@@ -228,6 +263,12 @@ class AdaptiveAgent:
             )
             subj_result = await self.db.execute(subj_q)
             subjects = list(subj_result.scalars().unique().all())
+            for subject in subjects:
+                subject.topics = [
+                    topic
+                    for topic in subject.topics
+                    if not topic.completed and topic.completion_pct < 100
+                ]
 
             # Get user's daily hours
             user = await self.db.get(User, self.user_id)
@@ -248,6 +289,10 @@ class AdaptiveAgent:
                 start_date=today,
                 end_date=end,
                 daily_hours=daily_hours,
+                avoid_topic_repeats=True,
+                enforce_unit_sequence=True,
+                distribute_across_range=False,
+                ensure_full_coverage=True,
             )
             entries = blocks_to_entries(self.user_id, blocks)
             self.db.add_all(entries)
@@ -280,3 +325,5 @@ class AdaptiveAgent:
         await self.plan_actions()
         await self.act()
         return await self.reflect()
+
+

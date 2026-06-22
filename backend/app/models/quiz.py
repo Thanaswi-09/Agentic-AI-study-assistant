@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, Float, Integer, Text, ForeignKey, DateTime, func
+from sqlalchemy import String, Float, Integer, Text, ForeignKey, DateTime, Boolean, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.database import Base
@@ -30,6 +30,7 @@ class Quiz(Base):
     )  # easy, medium, hard
     total_questions: Mapped[int] = mapped_column(Integer, default=5)
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    included_in_progress: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

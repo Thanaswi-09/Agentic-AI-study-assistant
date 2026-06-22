@@ -53,6 +53,7 @@ export const generateScheduleFromSyllabusPdf = (formData) =>
   });
 export const getSchedule = (userId) => api.get(`/schedule/${userId}`);
 export const completeEntry = (id) => api.patch(`/schedule/complete/${id}`);
+export const unreadEntry = (id) => api.patch(`/schedule/unread/${id}`);
 export const skipEntry = (id) => api.post(`/schedule/skip/${id}`);
 
 // ── Progress ────────────────────────────────────────────────────────
@@ -66,6 +67,9 @@ export const submitQuiz = (data) => api.post('/quiz/submit', data);
 // ── Agent ───────────────────────────────────────────────────────────
 export const adaptPlan = (userId) => api.post(`/agent/adapt?user_id=${userId}`);
 export const getInsights = (userId) => api.get(`/agent/insights/${userId}`);
+export const getMindMap = (userId) => api.get(`/mindmap/${userId}`);
+export const generateMindMapTopicDescription = (data) =>
+  api.post('/mindmap/describe-topic', data, { timeout: 45000 });
 
 // ── Chat ────────────────────────────────────────────────────────────
 export const askChatbot = (data) => api.post('/chat/ask', data);

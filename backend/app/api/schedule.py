@@ -13,7 +13,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from backend.app.database import ensure_db_ready, get_db
+from backend.app.database import async_session_factory, ensure_db_ready, get_db
 from backend.app.models.user import User
 from backend.app.models.subject import Subject
 from backend.app.models.topic import Topic
@@ -43,6 +43,7 @@ from backend.app.services.robust_syllabus import (
 )
 from backend.app.services.syllabus_ai import (
     extract_subjects_and_topics_with_llm,
+    correct_topic_spellings,
     looks_too_sparse_for_schedule,
 )
 from backend.app.services.topic_text import (
@@ -51,6 +52,7 @@ from backend.app.services.topic_text import (
     split_period_topic_list,
     topic_dedupe_key,
 )
+from backend.app.services.adaptive_agent import AdaptiveAgent
 from backend.app.api.syllabus import (
     _humanize_topic_text as _syllabus_humanize_topic_text,
     _is_strong_subject_name as _syllabus_is_strong_subject_name,
@@ -62,6 +64,7 @@ from backend.app.api.syllabus import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/schedule", tags=["schedule"])
+_SCHEMA_RECOVERY_SENTINEL = "_schema_recovery_retried"
 
 # Patterns and noise lists used throughout topic parsing/cleaning
 _UNIT_WITH_SUFFIX_PATTERN = re.compile(
@@ -156,6 +159,14 @@ def _clean_subject_name(name: str) -> str:
     return cleaned.strip(" .,-")
 
 
+def _resolved_subject_label(subject_name: str | None, filename: str | None) -> str:
+    label = _clean_subject_name(subject_name or "")
+    if label:
+        return label
+    stem = (filename or "").rsplit(".", 1)[0].strip()
+    return _clean_subject_name(stem)
+
+
 def _roman_to_int(token: str) -> int | None:
     t = token.strip().upper()
     if not t:
@@ -203,6 +214,58 @@ def _is_valid_topic_text(topic_name: str, subject_name: str | None = None) -> bo
     return _syllabus_is_valid_topic_text(topic_name, subject_name)
 
 
+def _is_schedule_safe_topic(
+    topic_name: str,
+    *,
+    subject_name: str | None,
+    unit_start: int,
+    unit_end: int,
+) -> bool:
+    text = _humanize_topic_text(topic_name)
+    if not text or not _is_valid_topic_text(text, subject_name):
+        return False
+    unit_no = _topic_unit_number(text)
+    if unit_no is None:
+        return False
+    if unit_no < unit_start or unit_no > unit_end:
+        return False
+    body = _topic_body_text(text)
+    if not body or _looks_like_reference_heading(body):
+        return False
+    if re.search(r"\b(?:mcgraw|mc graw|wiley|pearson|oxford|cambridge|edition|publishers?)\b", body, re.IGNORECASE):
+        return False
+    return True
+
+
+def _filter_schedule_topics(
+    topics: list[str],
+    *,
+    subject_name: str | None,
+    unit_start: int,
+    unit_end: int,
+    max_topics: int,
+) -> list[str]:
+    filtered: list[str] = []
+    seen: set[str] = set()
+    for topic_name in topics:
+        cleaned = _humanize_topic_text(topic_name)
+        if not _is_schedule_safe_topic(
+            cleaned,
+            subject_name=subject_name,
+            unit_start=unit_start,
+            unit_end=unit_end,
+        ):
+            continue
+        topic_key = _topic_dedupe_key(cleaned)
+        if topic_key in seen:
+            continue
+        seen.add(topic_key)
+        filtered.append(cleaned[:300])
+        if len(filtered) >= max_topics:
+            break
+    return filtered
+
+
 def _merge_subject_topic_sources(
     robust_subjects: dict[str, list[str]],
     parser_subjects: list[dict[str, object]],
@@ -223,7 +286,13 @@ def _merge_subject_topic_sources(
         if not raw_name:
             continue
         raw_topics = [str(topic or "").strip() for topic in list(subject.get("topics") or [])]
-        expanded_topics = _normalize_topic_items(raw_topics, raw_name)
+        expanded_topics = _filter_schedule_topics(
+            _normalize_topic_items(raw_topics, raw_name),
+            subject_name=raw_name,
+            unit_start=1,
+            unit_end=12,
+            max_topics=max_topics_per_subject,
+        )
         if not expanded_topics:
             continue
 
@@ -272,6 +341,13 @@ def _normalize_ai_subjects(
             [str(topic or "") for topic in list(subject.get("topics") or [])],
             raw_name,
         )
+        normalized_topics = _filter_schedule_topics(
+            normalized_topics,
+            subject_name=raw_name,
+            unit_start=1,
+            unit_end=12,
+            max_topics=max_topics_per_subject,
+        )
         if not normalized_topics:
             continue
 
@@ -302,6 +378,13 @@ def _merge_normalized_subject_lists(
             normalized_topics = _normalize_topic_items(
                 [str(topic or "") for topic in list(subject.get("topics") or [])],
                 raw_name,
+            )
+            normalized_topics = _filter_schedule_topics(
+                normalized_topics,
+                subject_name=raw_name,
+                unit_start=1,
+                unit_end=12,
+                max_topics=max_topics_per_subject,
             )
             if not normalized_topics:
                 continue
@@ -347,6 +430,54 @@ def _should_prefer_classic_subjects(
     if robust_count == 0:
         return True
     return robust_count >= max(classic_count * 2, classic_count + 20)
+
+
+def _collect_units_from_topic_names(topic_names: list[str]) -> set[int]:
+    units: set[int] = set()
+    for topic_name in topic_names:
+        unit_no = _topic_unit_number(topic_name)
+        if unit_no is not None:
+            units.add(unit_no)
+    return units
+
+
+def _should_prefer_unit_extractor(
+    *,
+    topics_by_unit: dict[int, list[str]],
+    parsed_subjects: list[dict[str, object]],
+    unit_start: int,
+    unit_end: int,
+) -> bool:
+    if not topics_by_unit:
+        return False
+
+    requested_units = {unit for unit in range(unit_start, unit_end + 1)}
+    extracted_units = {unit for unit in topics_by_unit if unit in requested_units and topics_by_unit[unit]}
+    if not extracted_units:
+        return False
+
+    parsed_topic_names = [
+        str(topic or "")
+        for subject in parsed_subjects
+        for topic in list(subject.get("topics") or [])
+    ]
+    parsed_units = {
+        unit for unit in _collect_units_from_topic_names(parsed_topic_names) if unit in requested_units
+    }
+    extracted_topic_count = sum(len(topics_by_unit.get(unit, [])) for unit in extracted_units)
+    parsed_topic_count = len(parsed_topic_names)
+
+    if not parsed_subjects:
+        return True
+    if len(parsed_subjects) > 1:
+        return False
+    if len(extracted_units) > len(parsed_units):
+        return True
+    if extracted_units == requested_units and extracted_topic_count >= parsed_topic_count:
+        return True
+    if len(extracted_units) >= max(2, len(requested_units) - 1) and extracted_topic_count >= parsed_topic_count + 3:
+        return True
+    return False
 
 def _build_revision_entries_between(
     *,
@@ -447,78 +578,92 @@ def _build_revision_entries_between(
 @router.post("/generate", response_model=list[ScheduleEntryOut], status_code=201)
 async def generate(payload: ScheduleGenerateRequest, db: AsyncSession = Depends(get_db)):
     """Generate (or regenerate) a study schedule for the date range."""
-    user = await db.get(User, payload.user_id)
-    if not user:
-        raise HTTPException(404, "User not found")
+    try:
+        user = await db.get(User, payload.user_id)
+        if not user:
+            raise HTTPException(404, "User not found")
 
-    # Load subjects with topics
-    result = await db.execute(
-        select(Subject)
-        .where(Subject.user_id == payload.user_id)
-        .options(selectinload(Subject.topics))
-    )
-    subjects = list(result.scalars().unique().all())
-    if not subjects:
-        raise HTTPException(400, "No subjects found — add subjects and topics first.")
+        # Load subjects with topics
+        result = await db.execute(
+            select(Subject)
+            .where(Subject.user_id == payload.user_id)
+            .options(selectinload(Subject.topics))
+        )
+        subjects = list(result.scalars().unique().all())
+        if not subjects:
+            raise HTTPException(400, "No subjects found - add subjects and topics first.")
 
-    if payload.no_ai_mode:
-        blocks = generate_schedule_rule_based(
-            user_id=payload.user_id,
-            subjects=subjects,
-            start_date=payload.start_date,
-            end_date=payload.end_date,
-            daily_hours=payload.daily_study_hours or user.daily_study_hours,
-            daily_start=payload.daily_start_time,
-            session_mins=payload.session_duration_mins,
-            break_mins=payload.break_duration_mins,
-            max_topics_per_day=payload.max_topics_per_day,
-            distribute_across_range=True,   # spread sessions evenly within the requested range
-            ensure_full_coverage=False,     # do not spill past end_date; keep timetable within range
-        )
-    else:
-        blocks = generate_schedule(
-            user_id=payload.user_id,
-            subjects=subjects,
-            start_date=payload.start_date,
-            end_date=payload.end_date,
-            daily_hours=payload.daily_study_hours or user.daily_study_hours,
-            daily_start=payload.daily_start_time,
-            session_mins=payload.session_duration_mins,
-            break_mins=payload.break_duration_mins,
-            max_topics_per_day=payload.max_topics_per_day,
-            avoid_topic_repeats=True,
-            enforce_unit_sequence=True,
-            distribute_across_range=True,
-            ensure_full_coverage=False,     # respect user date range; avoid extending the timetable
-        )
+        if payload.no_ai_mode:
+            blocks = generate_schedule_rule_based(
+                user_id=payload.user_id,
+                subjects=subjects,
+                start_date=payload.start_date,
+                end_date=payload.end_date,
+                daily_hours=payload.daily_study_hours or user.daily_study_hours,
+                daily_start=payload.daily_start_time,
+                session_mins=payload.session_duration_mins,
+                break_mins=payload.break_duration_mins,
+                max_topics_per_day=payload.max_topics_per_day,
+                distribute_across_range=True,
+                ensure_full_coverage=False,
+            )
+        else:
+            blocks = generate_schedule(
+                user_id=payload.user_id,
+                subjects=subjects,
+                start_date=payload.start_date,
+                end_date=payload.end_date,
+                daily_hours=payload.daily_study_hours or user.daily_study_hours,
+                daily_start=payload.daily_start_time,
+                session_mins=payload.session_duration_mins,
+                break_mins=payload.break_duration_mins,
+                max_topics_per_day=payload.max_topics_per_day,
+                avoid_topic_repeats=True,
+                enforce_unit_sequence=True,
+                distribute_across_range=True,
+                ensure_full_coverage=False,
+            )
 
-    # Regeneration replaces the user's future plan so every pending topic can be rescheduled cleanly.
-    await db.execute(
-        delete(ScheduleEntry).where(
-            ScheduleEntry.user_id == payload.user_id,
-            ScheduleEntry.scheduled_date >= payload.start_date,
+        await db.execute(
+            delete(ScheduleEntry).where(
+                ScheduleEntry.user_id == payload.user_id,
+                ScheduleEntry.scheduled_date >= payload.start_date,
+            )
         )
-    )
-    entries = blocks_to_entries(payload.user_id, blocks)
-    db.add_all(entries)
-    await db.flush()
+        entries = blocks_to_entries(payload.user_id, blocks)
+        db.add_all(entries)
+        await db.flush()
 
-    # Reload to get server defaults
-    generated_end_date = max(
-        (entry.scheduled_date for entry in entries),
-        default=payload.end_date,
-    )
-    q = (
-        select(ScheduleEntry)
-        .where(
-            ScheduleEntry.user_id == payload.user_id,
-            ScheduleEntry.scheduled_date >= payload.start_date,
-            ScheduleEntry.scheduled_date <= generated_end_date,
+        generated_end_date = max(
+            (entry.scheduled_date for entry in entries),
+            default=payload.end_date,
         )
-        .order_by(ScheduleEntry.scheduled_date, ScheduleEntry.start_time)
-    )
-    reloaded = await db.execute(q)
-    return _sanitize_schedule_entries(list(reloaded.scalars().all()))
+        q = (
+            select(ScheduleEntry)
+            .where(
+                ScheduleEntry.user_id == payload.user_id,
+                ScheduleEntry.scheduled_date >= payload.start_date,
+                ScheduleEntry.scheduled_date <= generated_end_date,
+            )
+            .order_by(ScheduleEntry.scheduled_date, ScheduleEntry.start_time)
+        )
+        reloaded = await db.execute(q)
+        return _sanitize_schedule_entries(list(reloaded.scalars().all()))
+    except OperationalError as exc:
+        await db.rollback()
+        if "no such table" in str(exc).lower():
+            if getattr(db, _SCHEMA_RECOVERY_SENTINEL, False):
+                raise HTTPException(
+                    503,
+                    "Database schema recovery was attempted, but schedule generation still failed.",
+                ) from exc
+            await ensure_db_ready()
+            async with async_session_factory() as recovered_db:
+                setattr(recovered_db, _SCHEMA_RECOVERY_SENTINEL, True)
+                result = await generate(payload, db=recovered_db)
+                await recovered_db.commit()
+                return result
+        raise HTTPException(400, f"Database error while generating schedule: {exc}") from exc
 
 
 @router.post(
@@ -592,6 +737,20 @@ async def generate_from_syllabus_pdf(
             0.25,
             min(default_topic_hours, max(session_duration_mins, 1) / 60.0),
         )
+        pdf_subject_label = _resolved_subject_label(subject_name, file.filename)
+
+        try:
+            topics_by_unit = extract_unit_topics_from_pdf_with_langchain(
+                raw_bytes,
+                unit_start=unit_start,
+                unit_end=unit_end,
+                max_topics_per_unit=max_topics_per_unit,
+            )
+        except RuntimeError:
+            topics_by_unit = {}
+        except Exception as exc:
+            logger.warning("Unit extractor failed during schedule import precheck: %s", exc)
+            topics_by_unit = {}
 
         if import_all_subjects:
             # Start from OCR-cleaned text and let the configured LLM extract only the requested units.
@@ -610,6 +769,7 @@ async def generate_from_syllabus_pdf(
                     unit_start=unit_start,
                     unit_end=unit_end,
                 ):
+                    llm_subjects = await correct_topic_spellings(llm_subjects)
                     parsed_subjects = _normalize_ai_subjects(
                         llm_subjects,
                         max_topics_per_subject=max_topics_per_unit,
@@ -664,11 +824,21 @@ async def generate_from_syllabus_pdf(
                     supplemental_subjects,
                     max_topics_per_subject=max_topics_per_unit,
                 )
+            if _should_prefer_unit_extractor(
+                topics_by_unit=topics_by_unit,
+                parsed_subjects=parsed_subjects,
+                unit_start=unit_start,
+                unit_end=unit_end,
+            ):
+                parsed_subjects = []
             if parsed_subjects:
                 for parsed_idx, parsed_subject in enumerate(parsed_subjects):
                     parsed_name = _clean_subject_name(parsed_subject.get("name") or "")
                     if not parsed_name:
-                        parsed_name = f"Subject {parsed_idx + 1}"
+                        if len(parsed_subjects) == 1 and pdf_subject_label:
+                            parsed_name = pdf_subject_label
+                        else:
+                            continue
                     subject = Subject(
                         user_id=user_id,
                         name=parsed_name[:200],
@@ -683,11 +853,22 @@ async def generate_from_syllabus_pdf(
 
                     seen_topics: set[str] = set()
                     per_subject_count = 0
-                    topic_candidates = _expand_unit_only_topics(
-                        [str(topic) for topic in parsed_subject.get("topics", [])]
+                    topic_candidates = _filter_schedule_topics(
+                        _expand_unit_only_topics([str(topic) for topic in parsed_subject.get("topics", [])]),
+                        subject_name=parsed_name,
+                        unit_start=unit_start,
+                        unit_end=unit_end,
+                        max_topics=max_topics_per_unit,
                     )
                     for raw_topic in topic_candidates:
                         for topic_clean in _split_topic_candidates(raw_topic):
+                            if not _is_schedule_safe_topic(
+                                topic_clean,
+                                subject_name=parsed_name,
+                                unit_start=unit_start,
+                                unit_end=unit_end,
+                            ):
+                                continue
                             topic_key = _topic_dedupe_key(topic_clean)
                             if topic_key in seen_topics:
                                 continue
@@ -712,29 +893,71 @@ async def generate_from_syllabus_pdf(
 
         # Fallback to Unit-based import when subject parser doesn't yield usable data.
         if not topics_created_records:
-            try:
-                topics_by_unit = extract_unit_topics_from_pdf_with_langchain(
-                    raw_bytes,
-                    unit_start=unit_start,
-                    unit_end=unit_end,
-                    max_topics_per_unit=max_topics_per_unit,
-                )
-            except RuntimeError as exc:
-                # Missing optional deps (e.g., langchain-text-splitters) or similar runtime guards.
-                # Surface as a client error so the UI can prompt for installing extras instead of 500.
-                raise HTTPException(400, str(exc)) from exc
-            except Exception as exc:
-                raise HTTPException(400, f"Could not parse syllabus PDF: {exc}") from exc
+            if not topics_by_unit:
+                try:
+                    topics_by_unit = extract_unit_topics_from_pdf_with_langchain(
+                        raw_bytes,
+                        unit_start=unit_start,
+                        unit_end=unit_end,
+                        max_topics_per_unit=max_topics_per_unit,
+                    )
+                except RuntimeError as exc:
+                    # Missing optional deps (e.g., langchain-text-splitters) or similar runtime guards.
+                    # Surface as a client error so the UI can prompt for installing extras instead of 500.
+                    raise HTTPException(400, str(exc)) from exc
+                except Exception as exc:
+                    raise HTTPException(400, f"Could not parse syllabus PDF: {exc}") from exc
 
             if not topics_by_unit:
-                # Graceful fallback: create a single placeholder topic so the timetable can still be generated.
-                topics_by_unit = {unit_start: ["General Review"]}
+                text = extract_pdf_text_robust(raw_bytes)
+                robust_subjects = parse_subjects_and_topics_robust(
+                    text,
+                    unit_start=1,
+                    unit_end=max(unit_end, 12),
+                    max_topics_per_subject=max_topics_per_unit,
+                )
+                flattened_topics: list[str] = []
+                seen_flattened: set[str] = set()
+                for robust_name, robust_topics in robust_subjects.items():
+                    normalized = _filter_schedule_topics(
+                        _normalize_topic_items(list(robust_topics), robust_name),
+                        subject_name=robust_name,
+                        unit_start=unit_start,
+                        unit_end=unit_end,
+                        max_topics=max_topics_per_unit,
+                    )
+                    for topic in normalized:
+                        topic_key = _topic_dedupe_key(topic)
+                        if topic_key in seen_flattened:
+                            continue
+                        seen_flattened.add(topic_key)
+                        flattened_topics.append(topic)
+                        unit_no = _topic_unit_number(topic)
+                        if unit_no is not None:
+                            topics_by_unit.setdefault(unit_no, []).append(_topic_body_text(topic))
 
-            label = (subject_name or "").strip()
+                if not flattened_topics:
+                    raise HTTPException(
+                        400,
+                        "Could not extract any real syllabus topics from this PDF. Please try a clearer PDF or adjust the unit range.",
+                    )
+
+                if not pdf_subject_label and len(robust_subjects) == 1:
+                    pdf_subject_label = _clean_subject_name(next(iter(robust_subjects.keys())))
+                if not pdf_subject_label:
+                    raise HTTPException(
+                        400,
+                        "Could not determine a subject name from the PDF. Please rename the PDF clearly or provide subject_name.",
+                    )
+            else:
+                flattened_topics = []
+
+            label = pdf_subject_label
             if not label:
-                label = (file.filename.rsplit(".", 1)[0] if file.filename else "").strip()
-            if not label:
-                label = "Uploaded Syllabus"
+                raise HTTPException(
+                    400,
+                    "Could not determine a subject name from the PDF. Please rename the PDF clearly or provide subject_name.",
+                )
 
             subject = Subject(
                 user_id=user_id,
@@ -748,25 +971,54 @@ async def generate_from_syllabus_pdf(
             created_subject_ids.append(subject.id)
             created_subject_names.append(subject.name)
 
-            for unit in sorted(topics_by_unit.keys()):
-                for topic in topics_by_unit[unit]:
-                    raw_topic_name = f"Unit {unit}: {topic}".strip()
-                    topic_names = _split_topic_candidates(raw_topic_name)
-                    if not topic_names:
-                        fallback_topic_name = _humanize_topic_text(raw_topic_name)
-                        if fallback_topic_name:
-                            topic_names = [fallback_topic_name]
-                    for topic_name in topic_names:
-                        topic_record = Topic(
-                            subject_id=subject.id,
-                            name=topic_name[:300],
-                            difficulty=min(max(default_topic_difficulty, 0.0), 1.0),
-                            estimated_hours=imported_topic_hours,
-                            order_index=topic_index,
-                        )
-                        db.add(topic_record)
-                        topics_created_records.append(topic_record)
-                        topic_index += 1
+            if topics_by_unit:
+                for unit in sorted(topics_by_unit.keys()):
+                    if unit < unit_start or unit > unit_end:
+                        continue
+                    for topic in topics_by_unit[unit]:
+                        raw_topic_name = f"Unit {unit}: {topic}".strip()
+                        topic_names = _split_topic_candidates(raw_topic_name)
+                        if not topic_names:
+                            fallback_topic_name = _humanize_topic_text(raw_topic_name)
+                            if fallback_topic_name:
+                                topic_names = [fallback_topic_name]
+                        for topic_name in topic_names:
+                            if not _is_schedule_safe_topic(
+                                topic_name,
+                                subject_name=label,
+                                unit_start=unit_start,
+                                unit_end=unit_end,
+                            ):
+                                continue
+                            topic_record = Topic(
+                                subject_id=subject.id,
+                                name=topic_name[:300],
+                                difficulty=min(max(default_topic_difficulty, 0.0), 1.0),
+                                estimated_hours=imported_topic_hours,
+                                order_index=topic_index,
+                            )
+                            db.add(topic_record)
+                            topics_created_records.append(topic_record)
+                            topic_index += 1
+            else:
+                for topic_name in flattened_topics:
+                    if not _is_schedule_safe_topic(
+                        topic_name,
+                        subject_name=label,
+                        unit_start=unit_start,
+                        unit_end=unit_end,
+                    ):
+                        continue
+                    topic_record = Topic(
+                        subject_id=subject.id,
+                        name=topic_name[:300],
+                        difficulty=min(max(default_topic_difficulty, 0.0), 1.0),
+                        estimated_hours=imported_topic_hours,
+                        order_index=topic_index,
+                    )
+                    db.add(topic_record)
+                    topics_created_records.append(topic_record)
+                    topic_index += 1
 
             await db.flush()
 
@@ -914,11 +1166,42 @@ async def generate_from_syllabus_pdf(
     except OperationalError as exc:
         await db.rollback()
         if "no such table" in str(exc).lower():
+            if getattr(db, _SCHEMA_RECOVERY_SENTINEL, False):
+                raise HTTPException(
+                    503,
+                    "Database schema recovery was attempted, but PDF schedule generation still failed.",
+                ) from exc
             await ensure_db_ready()
-            raise HTTPException(
-                503,
-                "Database tables were missing and schema recovery was triggered. Please try generating the schedule again.",
-            ) from exc
+            async with async_session_factory() as recovered_db:
+                setattr(recovered_db, _SCHEMA_RECOVERY_SENTINEL, True)
+                result = await generate_from_syllabus_pdf(
+                    user_id=user_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    subject_name=subject_name,
+                    exam_date=exam_date,
+                    daily_start_time=daily_start_time,
+                    daily_study_hours=daily_study_hours,
+                    session_duration_mins=session_duration_mins,
+                    break_duration_mins=break_duration_mins,
+                    default_topic_hours=default_topic_hours,
+                    default_topic_difficulty=default_topic_difficulty,
+                    unit_start=unit_start,
+                    unit_end=unit_end,
+                    max_topics_per_unit=max_topics_per_unit,
+                    max_topics_per_day=max_topics_per_day,
+                    include_revisions=include_revisions,
+                    revision_days=revision_days,
+                    auto_generate_quizzes=auto_generate_quizzes,
+                    quiz_difficulty=quiz_difficulty,
+                    quiz_questions=quiz_questions,
+                    no_ai_mode=no_ai_mode,
+                    import_all_subjects=import_all_subjects,
+                    file=file,
+                    db=recovered_db,
+                )
+                await recovered_db.commit()
+                return result
         raise HTTPException(400, f"Database error while generating schedule: {exc}") from exc
     except HTTPException:
         # Let FastAPI return the intended status/response.
@@ -935,6 +1218,20 @@ async def generate_from_syllabus_pdf(
 @router.get("/{user_id}", response_model=list[ScheduleEntryOut])
 async def get_schedule(user_id: str, db: AsyncSession = Depends(get_db)):
     """Get the full schedule for a user."""
+    today = date.today()
+    overdue_q = (
+        select(ScheduleEntry.id)
+        .where(
+            ScheduleEntry.user_id == user_id,
+            ScheduleEntry.completed == 0,
+            ScheduleEntry.scheduled_date < today,
+        )
+        .limit(1)
+    )
+    overdue_result = await db.execute(overdue_q)
+    if overdue_result.scalar_one_or_none():
+        await AdaptiveAgent(db, user_id).run()
+
     q = (
         select(ScheduleEntry)
         .where(ScheduleEntry.user_id == user_id)
@@ -973,9 +1270,27 @@ async def complete_entry(entry_id: str, db: AsyncSession = Depends(get_db)):
     return {"status": "completed", "entry_id": entry_id}
 
 
+@router.patch("/unread/{entry_id}")
+async def unread_entry(entry_id: str, db: AsyncSession = Depends(get_db)):
+    """Mark a schedule entry as unread again."""
+    entry = await db.get(ScheduleEntry, entry_id)
+    if not entry:
+        raise HTTPException(404, "Schedule entry not found")
+
+    entry.completed = 0
+    if entry.topic_id:
+        topic = await db.get(Topic, entry.topic_id)
+        if topic:
+            topic.completed = 0
+            topic.completion_pct = min(float(topic.completion_pct or 0.0), 99.0)
+
+    await db.flush()
+    return {"status": "unread", "entry_id": entry_id}
+
+
 @router.post("/skip/{entry_id}", response_model=ScheduleRescheduleOut)
 async def skip_and_reschedule(entry_id: str, db: AsyncSession = Depends(get_db)):
-    """Skip a schedule entry and move it to the next available day/time slot."""
+    """Skip a schedule entry and rebuild the upcoming plan starting from the next day."""
     entry = await db.get(ScheduleEntry, entry_id)
     if not entry:
         raise HTTPException(404, "Schedule entry not found")
@@ -983,68 +1298,120 @@ async def skip_and_reschedule(entry_id: str, db: AsyncSession = Depends(get_db))
     if entry.completed:
         raise HTTPException(400, "Completed session cannot be skipped")
 
-    base_start = datetime.combine(entry.scheduled_date, entry.start_time)
-    base_end = datetime.combine(entry.scheduled_date, entry.end_time)
-    duration = base_end - base_start
-    if duration.total_seconds() <= 0:
-        duration = timedelta(minutes=int(entry.duration_mins or 60))
+    user = await db.get(User, entry.user_id)
+    daily_capacity_mins = max(int((user.daily_study_hours if user and user.daily_study_hours else 4) * 60), 60)
+    next_day = entry.scheduled_date + timedelta(days=1)
 
-    new_day = entry.scheduled_date + timedelta(days=1)
-
-    while True:
-        existing_q = (
-            select(ScheduleEntry)
-            .where(
-                ScheduleEntry.user_id == entry.user_id,
-                ScheduleEntry.scheduled_date == new_day,
-            )
-            .order_by(ScheduleEntry.start_time)
+    future_q = (
+        select(ScheduleEntry)
+        .where(
+            ScheduleEntry.user_id == entry.user_id,
+            ScheduleEntry.completed == 0,
+            ScheduleEntry.id != entry.id,
+            ScheduleEntry.scheduled_date >= next_day,
         )
-        existing_result = await db.execute(existing_q)
-        existing = list(existing_result.scalars().all())
-
-        chosen_start = entry.start_time
-        chosen_end = (datetime.combine(new_day, chosen_start) + duration).time()
-
-        overlaps = any(
-            chosen_start < e.end_time and chosen_end > e.start_time
-            for e in existing
-        )
-        if not overlaps:
-            break
-
-        if existing:
-            last_end = existing[-1].end_time
-            chosen_start = (
-                datetime.combine(new_day, last_end) + timedelta(minutes=10)
-            ).time()
-            chosen_end = (datetime.combine(new_day, chosen_start) + duration).time()
-            overlaps = any(
-                chosen_start < e.end_time and chosen_end > e.start_time
-                for e in existing
-            )
-            if not overlaps:
-                break
-
-        new_day += timedelta(days=1)
-
-    new_entry = ScheduleEntry(
-        user_id=entry.user_id,
-        topic_id=entry.topic_id,
-        subject_name=entry.subject_name,
-        topic_name=entry.topic_name,
-        scheduled_date=new_day,
-        start_time=chosen_start,
-        end_time=chosen_end,
-        duration_mins=entry.duration_mins,
-        priority_score=min((entry.priority_score or 0) + 0.1, 1.5),
-        is_revision=1,
-        completed=0,
+        .order_by(ScheduleEntry.scheduled_date, ScheduleEntry.start_time)
     )
-    db.add(new_entry)
+    future_result = await db.execute(future_q)
+    future_entries = list(future_result.scalars().all())
 
+    def _entry_duration_mins(item: ScheduleEntry) -> int:
+        base_start = datetime.combine(item.scheduled_date, item.start_time)
+        base_end = datetime.combine(item.scheduled_date, item.end_time)
+        mins = int((base_end - base_start).total_seconds() // 60)
+        return mins if mins > 0 else int(item.duration_mins or 60)
+
+    same_day_starts = [item.start_time for item in future_entries if item.scheduled_date == next_day]
+    day_start = min([entry.start_time, *same_day_starts], default=entry.start_time)
+
+    gap_candidates: list[int] = []
+    same_day_entries = [item for item in future_entries if item.scheduled_date == next_day]
+    for current, nxt in zip(same_day_entries, same_day_entries[1:]):
+        gap = int(
+            (
+                datetime.combine(next_day, nxt.start_time)
+                - datetime.combine(next_day, current.end_time)
+            ).total_seconds()
+            // 60
+        )
+        if gap > 0:
+            gap_candidates.append(gap)
+    break_mins = min(gap_candidates) if gap_candidates else 15
+
+    queue = [
+        {
+            "topic_id": entry.topic_id,
+            "subject_name": entry.subject_name,
+            "topic_name": entry.topic_name,
+            "duration_mins": _entry_duration_mins(entry),
+            "priority_score": min((entry.priority_score or 0) + 0.1, 1.5),
+            "is_revision": 1,
+            "is_skipped": True,
+        }
+    ]
+    queue.extend(
+        {
+            "topic_id": item.topic_id,
+            "subject_name": item.subject_name,
+            "topic_name": item.topic_name,
+            "duration_mins": _entry_duration_mins(item),
+            "priority_score": item.priority_score,
+            "is_revision": item.is_revision,
+            "is_skipped": False,
+        }
+        for item in future_entries
+    )
+
+    for item in future_entries:
+        await db.delete(item)
     await db.delete(entry)
     await db.flush()
+
+    scheduled_entries: list[ScheduleEntry] = []
+    current_day = next_day
+    queue_idx = 0
+
+    while queue_idx < len(queue):
+        cursor = datetime.combine(current_day, day_start)
+        planned_mins = 0
+
+        while queue_idx < len(queue):
+            item = queue[queue_idx]
+            duration_mins = max(int(item["duration_mins"] or 60), 15)
+            if planned_mins and planned_mins + duration_mins > daily_capacity_mins:
+                break
+            if not planned_mins and duration_mins > daily_capacity_mins:
+                duration_mins = daily_capacity_mins
+
+            start_dt = cursor
+            end_dt = start_dt + timedelta(minutes=duration_mins)
+            scheduled_entry = ScheduleEntry(
+                user_id=entry.user_id,
+                topic_id=item["topic_id"],
+                subject_name=item["subject_name"],
+                topic_name=item["topic_name"],
+                scheduled_date=current_day,
+                start_time=start_dt.time(),
+                end_time=end_dt.time(),
+                duration_mins=duration_mins,
+                priority_score=float(item["priority_score"] or 0),
+                is_revision=int(item["is_revision"] or 0),
+                completed=0,
+            )
+            db.add(scheduled_entry)
+            scheduled_entries.append(scheduled_entry)
+
+            cursor = end_dt + timedelta(minutes=break_mins)
+            planned_mins += duration_mins
+            queue_idx += 1
+
+        current_day += timedelta(days=1)
+
+    await db.flush()
+    new_entry = next(
+        item for item in scheduled_entries
+        if item.topic_id == entry.topic_id and item.subject_name == entry.subject_name and item.topic_name == entry.topic_name
+    )
     await db.refresh(new_entry)
 
     return {

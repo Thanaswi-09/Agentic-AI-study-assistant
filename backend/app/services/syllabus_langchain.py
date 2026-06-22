@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from backend.app.services.syllabus_parser import extract_text_from_pdf, parse_subjects_and_topics
+from backend.app.services.topic_text import humanize_topic_text, split_period_topic_list
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -69,7 +70,7 @@ def _is_topic_line(line: str) -> bool:
 
 
 def _normalize_topic_text(text: str) -> str:
-    cleaned = _NON_ALNUM.sub(" ", text)
+    cleaned = humanize_topic_text(_NON_ALNUM.sub(" ", text))
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,-")
     return cleaned
 
@@ -95,7 +96,10 @@ def _split_compound_topics(line: str) -> list[str]:
         candidate = suffix.strip() or candidate
 
     # Keep commas/"and" inside a topic to preserve complete meaning.
-    parts = [part.strip(" .-") for part in _TOPIC_SEPARATORS.split(candidate)]
+    expanded_candidates = split_period_topic_list(candidate)
+    parts: list[str] = []
+    for item in expanded_candidates:
+        parts.extend(part.strip(" .-") for part in _TOPIC_SEPARATORS.split(item))
     cleaned = [_normalize_topic_text(part) for part in parts]
     cleaned = [part for part in cleaned if _is_quality_topic(part)]
     return cleaned or ([candidate] if _is_topic_line(candidate) else [])

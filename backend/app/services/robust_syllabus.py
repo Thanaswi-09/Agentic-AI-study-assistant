@@ -7,6 +7,7 @@ import re
 
 from pypdf import PdfReader
 from backend.app.services.syllabus_parser import extract_text_from_pdf
+from backend.app.services.topic_text import humanize_topic_text, split_period_topic_list
 
 try:
     import fitz  # PyMuPDF
@@ -336,7 +337,7 @@ def _roman_to_int(value: str) -> int | None:
 
 
 def _clean_text(line: str) -> str:
-    cleaned = line.strip().strip("|")
+    cleaned = humanize_topic_text(line.strip().strip("|"))
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"([a-z])([A-Z])", r"\1 \2", cleaned)
     cleaned = re.sub(r"([A-Za-z])(\d)", r"\1 \2", cleaned)
@@ -344,6 +345,11 @@ def _clean_text(line: str) -> str:
     cleaned = re.sub(r"\s*[-–]\s*", " - ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip(" .,-")
+
+
+def _expand_topic_variants(line: str) -> list[str]:
+    expanded = split_period_topic_list(_clean_text(line))
+    return [_clean_text(item) for item in expanded if _clean_text(item)]
 
 
 def extract_pdf_text_robust(pdf_bytes: bytes) -> str:
@@ -451,7 +457,9 @@ def parse_subjects_and_topics_robust(
             if unit_num and unit_start <= unit_num <= unit_end:
                 current_unit = unit_num
                 if suffix and _is_topic_candidate(suffix):
-                    subjects[current_subject].append(f"Unit {unit_num}: {suffix}")
+                    for part in _expand_topic_variants(suffix):
+                        if _is_topic_candidate(part):
+                            subjects[current_subject].append(f"Unit {unit_num}: {part}")
             else:
                 current_unit = None
             idx += 1
@@ -463,15 +471,18 @@ def parse_subjects_and_topics_robust(
             if unit_num and unit_start <= unit_num <= unit_end:
                 next_line = _clean_text(lines[idx + 1]) if idx + 1 < len(lines) else ""
                 if next_line and not UNIT_RE.match(next_line):
-                    if _is_topic_candidate(next_line):
-                        subjects[current_subject].append(f"Unit {unit_num}: {next_line}")
+                    for part in _expand_topic_variants(next_line):
+                        if _is_topic_candidate(part):
+                            subjects[current_subject].append(f"Unit {unit_num}: {part}")
                     idx += 2
                     continue
             idx += 1
             continue
 
         if current_unit is not None and _is_topic_candidate(line):
-            subjects[current_subject].append(f"Unit {current_unit}: {line}")
+            for part in _expand_topic_variants(line):
+                if _is_topic_candidate(part):
+                    subjects[current_subject].append(f"Unit {current_unit}: {part}")
         # Ignore non-unit lines to prevent course description/book lines from polluting topics.
 
         idx += 1

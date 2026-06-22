@@ -40,7 +40,7 @@ W_PROG = 0.30
 W_REV  = 0.15
 
 REVISION_INTERVAL_DAYS = [1, 3, 7, 14, 30]  # spaced-repetition intervals
-UNIT_TAG_PATTERN = re.compile(r"^\s*unit\s+([ivxlcdm\d]+)\b", re.IGNORECASE)
+UNIT_TAG_PATTERN = re.compile(r"\bunit\s+([ivxlcdm\d]+)\b", re.IGNORECASE)
 
 
 # ── Helper data classes ─────────────────────────────────────────────
@@ -139,8 +139,14 @@ def _roman_to_int(token: str) -> int | None:
 
 
 def _topic_unit_number(name: str) -> int | None:
-    match = UNIT_TAG_PATTERN.match(name or "")
+    match = UNIT_TAG_PATTERN.search(name or "")
     return _roman_to_int(match.group(1)) if match else None
+
+
+def _topic_order_key(topic: Topic) -> tuple[int, int, str]:
+    unit_number = _topic_unit_number(topic.name)
+    unit_sort = unit_number if unit_number is not None else 10**6
+    return (unit_sort, int(topic.order_index or 0), str(topic.name or "").lower())
 
 
 def _clean_display_text(text: str) -> str:
@@ -185,7 +191,7 @@ def generate_schedule_rule_based(
         return max(1, math.ceil(remaining_mins / max(session_mins, 1)))
 
     for subj in subjects:
-        sorted_topics = sorted(subj.topics, key=lambda t: (t.order_index, t.name))
+        sorted_topics = sorted(subj.topics, key=_topic_order_key)
         for topic in sorted_topics:
             required = _sessions_required(topic)
             topic_state = {
@@ -376,8 +382,10 @@ def generate_schedule(
         scheduled_subjects_today: set[str] = set()  # spread slots across subjects when possible
         scheduled_units: set[str] = set()  # spread across units if topic names include unit tags
 
+        subject_order = {subj.id: idx for idx, subj in enumerate(subjects)}
+
         def _unit_key(name: str) -> str:
-            match = UNIT_TAG_PATTERN.match(name or "")
+            match = UNIT_TAG_PATTERN.search(name or "")
             return match.group(1).upper() if match else ""
 
         def _roman_to_int(token: str) -> int | None:
@@ -445,6 +453,14 @@ def generate_schedule(
                             and _unit_number(tp.topic.name) == target_unit
                         )
                     ]
+                    unit_candidates.sort(
+                        key=lambda tp: (
+                            subject_order.get(tp.subject.id, 10**6),
+                            int(tp.topic.order_index or 0),
+                            str(tp.topic.name or "").lower(),
+                            -tp.priority_score,
+                        )
+                    )
                     fresh_subject_candidates = [
                         tp for tp in unit_candidates if tp.subject.id not in scheduled_subjects_today
                     ]
@@ -462,6 +478,14 @@ def generate_schedule(
                             and _unit_number(tp.topic.name) is None
                         )
                     ]
+                    no_unit_candidates.sort(
+                        key=lambda tp: (
+                            subject_order.get(tp.subject.id, 10**6),
+                            int(tp.topic.order_index or 0),
+                            str(tp.topic.name or "").lower(),
+                            -tp.priority_score,
+                        )
+                    )
                     fresh_subject_candidates = [
                         tp for tp in no_unit_candidates if tp.subject.id not in scheduled_subjects_today
                     ]

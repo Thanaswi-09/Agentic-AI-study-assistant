@@ -3,14 +3,9 @@ import RequireUser from '../components/RequireUser';
 import { useUser } from '../context/UserContext';
 import { askChatbot, getChatHistory } from '../services/api';
 import toast from 'react-hot-toast';
-import { Bot, SendHorizonal, User, Mic, MicOff, Play, Square, Trash2 } from 'lucide-react';
+import { Bot, SendHorizonal, User, Mic, MicOff, Play, Square, Trash2, MessageSquareText } from 'lucide-react';
 
-const STARTERS = [
-  'What should I study next?',
-  'List my subjects',
-  'Show topics in Data Analytics',
-  'How should I revise Unit 1?',
-];
+const STARTERS = [];
 
 const SESSION_GAP_MINUTES = 45;
 const SESSION_META_KEY = (userId) => `chatSessions:${userId || 'anon'}`;
@@ -19,7 +14,7 @@ const MSG_SESSION_KEY = (userId) => `chatMsgSession:${userId || 'anon'}`;
 
 const WELCOME = {
   role: 'assistant',
-  text: 'Ask me anything educational. I can chat naturally and also use your study data when relevant.',
+  text: 'Ask any educational question.',
   suggestions: STARTERS,
 };
 
@@ -476,11 +471,34 @@ export default function Chatbot() {
 
   return (
     <RequireUser>
-      <div className="page chatbot-page">
-        <h1 className="page-title">Educational Chatbot</h1>
+      <div className="page page-wide chatbot-page">
+        <section className="page-hero chatbot-hero">
+          <div>
+            <span className="page-kicker">
+              <MessageSquareText size={14} />
+              Chatbot
+            </span>
+            <h1 className="page-title">Educational Chatbot</h1>
+            <p className="page-copy">Ask concept doubts, revision questions, and study-planning questions with saved chat sessions.</p>
+          </div>
+          <div className="page-hero-stats">
+            <article>
+              <span>Chats</span>
+              <strong>{sessions.length}</strong>
+            </article>
+            <article>
+              <span>Messages</span>
+              <strong>{allMessages.length}</strong>
+            </article>
+            <article>
+              <span>Mode</span>
+              <strong>{hasRecognition ? 'Voice ready' : 'Text only'}</strong>
+            </article>
+          </div>
+        </section>
 
         <div className="card card-info">
-          Ask concept doubts, exam questions, revision help, or study-planning questions. The chatbot can answer general educational questions and also use your saved subjects, topics, and timetable when relevant.
+          Ask concept doubts, exam questions, revision help, or study-planning questions.
         </div>
 
         {!hasRecognition && (
